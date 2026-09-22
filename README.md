@@ -27,12 +27,14 @@ Progress, results and dead ends are logged chronologically in [LAB_NOTEBOOK.md](
 | `core/trace.py` | append-only JSONL trace of every LLM and tool call |
 | `run.py` / `prep.py` / `test.py` | run one episode / build task dirs / unit tests (no GPU or LLM needed) |
 | `serve.sh` | start/stop vLLM (own venv, runs as the user) on the highest free GPU |
+| `setup.sh` | one-time server setup: vLLM venv, CUDA forward-compat libs, model weights (no root) |
 | `batch.sh` | unattended multi-seed run: start server, run seeds in parallel, summarise, release GPU |
 | `env/Dockerfile` | sandbox runtime image |
 
 ## Running
 
 ```bash
+./setup.sh                            # once
 ./serve.sh                            # vLLM on highest free GPU (3>2>1>0), localhost:8011
 docker build -t exp-rt:cpu env/       # sandbox image
 python prep.py dev-adult --out data   # smoke-test task

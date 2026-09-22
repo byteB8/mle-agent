@@ -25,6 +25,13 @@ if [ "$GPU" = auto ]; then
   [ -n "$GPU" ] || { echo "no free GPU"; exit 1; }
 fi
 
+# vLLM's torch is built for CUDA 13; the host driver (565) only speaks CUDA 12.7. NVIDIA's forward-compat
+# libcuda (datacenter GPUs only) bridges that without root -- see setup.sh.
+COMPAT=$BASE/compat/x/usr/local/cuda-13.0/compat
+[ -d "$COMPAT" ] && export LD_LIBRARY_PATH=$COMPAT${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+export PATH=$BASE/venv/bin:$PATH   # JIT kernel builds call ninja from the venv
+# the host nvcc is CUDA 10.1, too old for FlashInfer JIT; use the (prebuilt-free) PyTorch sampler instead
+export VLLM_USE_FLASHINFER_SAMPLER=0 FLASHINFER_WORKSPACE_BASE=$BASE/cache
 export CUDA_VISIBLE_DEVICES=$GPU HF_HOME=$BASE/hf HF_HUB_OFFLINE=1 TMPDIR=$BASE/tmp \
        VLLM_CACHE_ROOT=$BASE/cache/vllm TORCHINDUCTOR_CACHE_DIR=$BASE/cache/inductor \
        TRITON_CACHE_DIR=$BASE/cache/triton XDG_CACHE_HOME=$BASE/cache
