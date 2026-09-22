@@ -26,7 +26,8 @@ Progress, results and dead ends are logged chronologically in [LAB_NOTEBOOK.md](
 | `core/tasks.py` | task spec, submission format checks, graders |
 | `core/trace.py` | append-only JSONL trace of every LLM and tool call |
 | `run.py` / `prep.py` / `test.py` | run one episode / build task dirs / unit tests (no GPU or LLM needed) |
-| `serve.sh` | start vLLM on one GPU |
+| `serve.sh` | start/stop vLLM (own venv, runs as the user) on the highest free GPU |
+| `batch.sh` | unattended multi-seed run: start server, run seeds in parallel, summarise, release GPU |
 | `env/Dockerfile` | sandbox runtime image |
 
 ## Running

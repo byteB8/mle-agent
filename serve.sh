@@ -1,24 +1,37 @@
 #!/usr/bin/env bash
-# Start the local LLM server (vLLM, OpenAI-compatible) on one GPU, bound to localhost.
+# Start/stop the local LLM server (vLLM, OpenAI-compatible) on one GPU, bound to localhost.
 #   ./serve.sh [gpu|auto] [port]      auto = highest free GPU index first (3 > 2 > 1 > 0)
+#   ./serve.sh stop
+# Runs natively from its own venv (not Docker) so the GPU process belongs to the invoking user,
+# and all caches/temp files stay under $BASE instead of the root filesystem.
 set -euo pipefail
+cd "$(dirname "$0")"
+BASE=$(pwd)
+PIDFILE=$BASE/logs/srv.pid
+mkdir -p "$BASE/logs" "$BASE/cache" "$BASE/tmp"
+
+if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+  kill "$(cat "$PIDFILE")"; sleep 5
+fi
+rm -f "$PIDFILE"
+[ "${1:-}" = stop ] && { echo stopped; exit 0; }
+
 PORT=${2:-8011}
 MODEL=${MODEL:-Qwen/Qwen3-Coder-30B-A3B-Instruct}
-HF=${HF:-$HOME/work/exp/hf}
-
-docker rm -f srv >/dev/null 2>&1 || true
 GPU=${1:-auto}
 if [ "$GPU" = auto ]; then
-  sleep 3  # let a replaced server release its memory
   GPU=$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits \
         | awk -F', ' '$2 < 1000 {print $1}' | sort -rn | head -1)
   [ -n "$GPU" ] || { echo "no free GPU"; exit 1; }
 fi
-docker run -d --name srv --gpus "device=${GPU}" --ipc=host \
-  -p 127.0.0.1:${PORT}:8000 -v "${HF}:/root/.cache/huggingface" -e HF_HUB_OFFLINE=1 \
-  vllm/vllm-openai:v0.30.0 \
-  --model "${MODEL}" --served-model-name coder \
+
+export CUDA_VISIBLE_DEVICES=$GPU HF_HOME=$BASE/hf HF_HUB_OFFLINE=1 TMPDIR=$BASE/tmp \
+       VLLM_CACHE_ROOT=$BASE/cache/vllm TORCHINDUCTOR_CACHE_DIR=$BASE/cache/inductor \
+       TRITON_CACHE_DIR=$BASE/cache/triton XDG_CACHE_HOME=$BASE/cache
+setsid nohup venv/bin/vllm serve "$MODEL" --served-model-name coder \
+  --host 127.0.0.1 --port "$PORT" \
   --max-model-len 65536 --gpu-memory-utilization 0.92 \
   --enable-auto-tool-choice --tool-call-parser qwen3_coder \
-  --enable-prefix-caching
-echo "started srv on GPU ${GPU}, port ${PORT}; logs: docker logs -f srv"
+  --enable-prefix-caching > "$BASE/logs/srv.log" 2>&1 < /dev/null &
+echo $! > "$PIDFILE"
+echo "started vLLM (pid $(cat "$PIDFILE")) on GPU ${GPU}, port ${PORT}; log: logs/srv.log"

@@ -9,7 +9,7 @@ SSH="ssh -p ${PORT:-22}"
 case "${1:-push}" in
   push) rsync -az -e "$SSH" --delete \
           --exclude .git --exclude '*.md' --exclude .remote --exclude sync.sh --exclude __pycache__ \
-          --exclude runs/ --exclude data/ --exclude hf/ --exclude logs/ --exclude results/ \
+          --exclude runs/ --exclude data/ --exclude hf/ --exclude cache/ --exclude venv/ --exclude tmp/ --exclude logs/ --exclude results/ \
           ./ "${REMOTE}:${DIR}/" ;;
   pull) rsync -az -e "$SSH" --exclude 'work/' "${REMOTE}:${DIR}/runs/" results/runs/ ;;
   *) echo "usage: $0 push|pull"; exit 1 ;;
