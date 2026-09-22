@@ -1,0 +1,6 @@
+.remote
+__pycache__/
+*.pyc
+runs/
+data/
+results/
