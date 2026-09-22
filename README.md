@@ -32,7 +32,7 @@ Progress, results and dead ends are logged chronologically in [LAB_NOTEBOOK.md](
 ## Running
 
 ```bash
-./serve.sh 1                          # vLLM on GPU 1, localhost:8011
+./serve.sh                            # vLLM on highest free GPU (3>2>1>0), localhost:8011
 docker build -t exp-rt:cpu env/       # sandbox image
 python prep.py dev-adult --out data   # smoke-test task
 python run.py --task data/dev-adult --time-limit-min 30

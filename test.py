@@ -11,6 +11,7 @@ from pathlib import Path
 import pandas as pd
 
 from core.agent import Agent, Budget, compact
+from core.gpu import parse_free
 from core.llm import Completion, _normalise
 from core.sandbox import DockerSandbox, ExecResult, truncate
 from core.tasks import Task
@@ -100,6 +101,13 @@ class TestSandboxHelpers(unittest.TestCase):
             for bad in ("../etc/passwd", "/etc/passwd", "/work/../../x"):
                 with self.assertRaises(ValueError):
                     sb.host_path(bad)
+
+
+class TestGpu(unittest.TestCase):
+    def test_highest_free_index_first(self):
+        smi = "0, 36955\n1, 74827\n2, 9\n3, 9\n"
+        self.assertEqual(parse_free(smi), [3, 2])
+        self.assertEqual(parse_free("0, 5\n1, 5\n2, 50000\n3, 70000\n"), [1, 0])
 
 
 class TestTask(unittest.TestCase):

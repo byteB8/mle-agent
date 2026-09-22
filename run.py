@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 from core.agent import Agent, Budget
+from core.gpu import pick_gpu
 from core.llm import LLM
 from core.sandbox import DockerSandbox
 from core.tasks import Task
@@ -29,10 +30,12 @@ def main() -> None:
     ap.add_argument("--time-limit-min", type=float, default=60)
     ap.add_argument("--cpus", type=float, default=8)
     ap.add_argument("--memory", default="32g")
-    ap.add_argument("--gpus", default=None, help="GPU index for the sandbox, e.g. 2")
+    ap.add_argument("--gpus", default=None, help="GPU index for the sandbox, or 'auto' (highest free index)")
     ap.add_argument("--image", default="exp-rt:cpu")
     args = ap.parse_args()
 
+    if args.gpus == "auto":
+        args.gpus = str(pick_gpu())
     task = Task.load(args.task)
     run_id = f"{args.tag}-{task.name}-s{args.seed}-{time.strftime('%Y%m%d-%H%M%S')}"
     out = Path(args.out) / run_id
