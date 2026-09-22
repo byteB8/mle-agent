@@ -10,6 +10,7 @@ import json
 import shutil
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from .llm import LLM, LLMError
 from .sandbox import DockerSandbox, truncate
@@ -58,6 +59,12 @@ class EpisodeState:
         return time.monotonic() - self.t0
 
 
+def accepted_path(sandbox: DockerSandbox) -> Path:
+    """Where an accepted submission is stored: next to /work, never inside it, so the agent
+    can neither collide with it nor plant an unvalidated file there."""
+    return sandbox.workdir.parent / "accepted_submission.csv"
+
+
 def make_tools(sandbox: DockerSandbox, task: Task, state: EpisodeState, budget: Budget) -> ToolRegistry:
     def bash(command: str, timeout: int = 600) -> ToolResult:
         remaining = int(budget.time_limit_s - state.elapsed())
@@ -85,7 +92,7 @@ def make_tools(sandbox: DockerSandbox, task: Task, state: EpisodeState, budget: 
         errors = task.validate_submission(p)
         if errors:
             return ToolResult("submission rejected:\n- " + "\n- ".join(errors), error=True)
-        shutil.copy(p, sandbox.workdir / "final_submission.csv")
+        shutil.copyfile(p, accepted_path(sandbox))
         state.submitted = str(p)
         return ToolResult("submission accepted. Episode finished.", done=True)
 
@@ -213,12 +220,14 @@ class Agent:
         return result
 
     def _finish(self, stop_reason: str) -> dict:
-        final = self.sandbox.workdir / "final_submission.csv"
-        if not final.exists():
-            # fall back to whatever the agent left behind, if it is valid
+        final = accepted_path(self.sandbox)
+        source = "submit" if final.exists() else None
+        if source is None:
+            # budget ran out: fall back to what the agent left behind, but only if it validates
             fallback = self.sandbox.workdir / "submission.csv"
             if fallback.exists() and not self.task.validate_submission(fallback):
-                shutil.copy(fallback, final)
+                shutil.copyfile(fallback, final)
+                source = "fallback"
         score = None
         if final.exists():
             try:
@@ -227,6 +236,7 @@ class Agent:
                 self.tracer.log("grade_error", error=str(e))
         return {"stop_reason": stop_reason, "score": score, "metric": self.task.metric,
                 "higher_is_better": self.task.higher_is_better, "valid_submission": final.exists(),
+                "submission_source": source,
                 "steps": self.state.step, "elapsed_s": round(self.state.elapsed(), 1),
                 "total_prompt_tokens": self.state.total_prompt_tokens,
                 "completion_tokens": self.state.completion_tokens}

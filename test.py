@@ -166,6 +166,30 @@ class TestAgent(unittest.TestCase):
             self.assertEqual(res["stop_reason"], "max_steps")
             self.assertTrue(res["valid_submission"])
 
+    def test_submit_any_name_and_no_unvalidated_grading(self):
+        # regression: a submission named like the harness's own output file must still be accepted,
+        # and a malformed file planted in /work must never be graded
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            task = make_task(d / "t")
+            (d / "work").mkdir()
+            pd.DataFrame({"id": [1, 2, 3, 4], "y": [.1, .9, .2, .8]}).to_csv(d / "work/final_submission.csv", index=False)
+            llm = ScriptedLLM([call("submit", path="/work/final_submission.csv")])
+            with LocalSandbox("x", "img", d / "work", task.public_dir) as sb:
+                res = Agent(llm, task, sb, Tracer(None), Budget(max_steps=5)).run()
+            self.assertEqual((res["stop_reason"], res["submission_source"]), ("submitted", "submit"))
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            task = make_task(d / "t")
+            (d / "work").mkdir()
+            pd.DataFrame({"id": [1], "junk": [0]}).to_csv(d / "work/final_submission.csv", index=False)
+            pd.DataFrame({"id": [1], "junk": [0]}).to_csv(d / "work/submission.csv", index=False)
+            llm = ScriptedLLM([call("bash", command="true")] * 2)
+            with LocalSandbox("x", "img", d / "work", task.public_dir) as sb:
+                res = Agent(llm, task, sb, Tracer(None), Budget(max_steps=2)).run()
+            self.assertIsNone(res["score"])
+            self.assertFalse(res["valid_submission"])
+
     def test_compact_keeps_pairs_and_recent(self):
         msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
         for i in range(30):

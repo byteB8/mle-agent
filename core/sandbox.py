@@ -79,7 +79,7 @@ class DockerSandbox:
         if rel == "/work" or rel.startswith("/work/"):
             rel = rel[len("/work"):].lstrip("/")
         elif rel.startswith("/"):
-            raise ValueError("only paths under /work are accessible")
+            raise ValueError(f"{rel}: only paths under /work are accessible here (save the file under /work)")
         p = (self.workdir / rel).resolve()
         if p != self.workdir and self.workdir not in p.parents:
             raise ValueError(f"path escapes /work: {rel}")
