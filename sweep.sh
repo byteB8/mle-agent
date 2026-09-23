@@ -14,7 +14,7 @@ for arm in "$@"; do
   say "arm $tag: $args"
   # shellcheck disable=SC2086  # args are intentionally word-split
   KEEP_SERVER=1 ./batch.sh "$TASK" "$tag" "$SEEDS" $args
-  grep -A8 "summary:" "logs/batch-${tag}.log" | tail -1 >>"$LOG"
+  echo "  $tag: $(grep "valid  mean=" "logs/batch-${tag}.log" | tail -1)" >>"$LOG"
 done
 ./serve.sh stop >>"$LOG" 2>&1
 say "sweep done"
