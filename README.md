@@ -13,7 +13,6 @@ then solution-tree search, memory and budget-aware scheduling, each measured wit
 **Phase 2** – distil successful trajectories into a small open model (LoRA) and compare
 quality vs. cost against the large model.
 
-Progress, results and dead ends are logged chronologically in [LAB_NOTEBOOK.md](LAB_NOTEBOOK.md).
 
 ## Layout
 
@@ -29,6 +28,8 @@ Progress, results and dead ends are logged chronologically in [LAB_NOTEBOOK.md](
 | `serve.sh` | start/stop vLLM (own venv, runs as the user) on the highest free GPU |
 | `setup.sh` | one-time server setup: vLLM venv, CUDA forward-compat libs, model weights (no root) |
 | `batch.sh` | unattended multi-seed run: start server, run seeds in parallel, summarise, release GPU |
+| `sweep.sh` | several experiment arms back to back on one server (ablations) |
+| `stats.py` | per-run behaviour stats from traces (errors, CV use, early submits, tokens) |
 | `env/Dockerfile` | sandbox runtime image |
 
 ## Running

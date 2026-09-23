@@ -44,6 +44,7 @@ class Budget:
     max_total_tokens: int = 3_000_000
     context_tokens: int = 60_000        # compact history above this prompt size
     cmd_timeout_s: int = 900
+    min_submit_frac: float = 0.0        # reject `submit` before this fraction of wall-clock is used
 
 
 @dataclass
@@ -54,6 +55,7 @@ class EpisodeState:
     total_prompt_tokens: int = 0    # summed over calls (compute cost)
     completion_tokens: int = 0
     submitted: str | None = None
+    early_submits: int = 0
 
     def elapsed(self) -> float:
         return time.monotonic() - self.t0
@@ -63,6 +65,31 @@ def accepted_path(sandbox: DockerSandbox) -> Path:
     """Where an accepted submission is stored: next to /work, never inside it, so the agent
     can neither collide with it nor plant an unvalidated file there."""
     return sandbox.workdir.parent / "accepted_submission.csv"
+
+
+def provisional_path(sandbox: DockerSandbox) -> Path:
+    """Latest valid submission that was refused only because it came too early (submit gate)."""
+    return sandbox.workdir.parent / "provisional_submission.csv"
+
+
+ENV_PACKAGES = ["numpy", "pandas", "scipy", "scikit-learn", "lightgbm", "xgboost", "catboost"]
+ENV_PROBE = ("import sys, importlib.metadata as m\n"
+             "print('python', sys.version.split()[0])\n"
+             f"for p in {ENV_PACKAGES!r}:\n"
+             "    try: print(p, m.version(p))\n"
+             "    except m.PackageNotFoundError: print(p, 'not installed')\n")
+
+
+def env_facts(sandbox: DockerSandbox) -> str:
+    """Installed versions, read from the sandbox itself, plus a general debugging rule.
+    Deliberately task-agnostic: no library-specific API hints."""
+    r = sandbox.exec(f"python3 - <<'EOF'\n{ENV_PROBE}EOF", timeout=60)
+    versions = r.output.strip() if r.exit_code == 0 else "unavailable"
+    return ("\n\nInstalled versions (authoritative; your memory of these libraries' APIs may be outdated):\n"
+            f"{versions}\n"
+            "If a call fails with an unexpected/unknown-argument error, inspect the installed signature "
+            "(e.g. `python -c \"import inspect, lib; print(inspect.signature(lib.fn))\"` or help()) "
+            "and adapt, instead of retrying variants from memory.")
 
 
 def make_tools(sandbox: DockerSandbox, task: Task, state: EpisodeState, budget: Budget) -> ToolRegistry:
@@ -92,6 +119,16 @@ def make_tools(sandbox: DockerSandbox, task: Task, state: EpisodeState, budget: 
         errors = task.validate_submission(p)
         if errors:
             return ToolResult("submission rejected:\n- " + "\n- ".join(errors), error=True)
+        earliest = budget.min_submit_frac * budget.time_limit_s
+        if state.elapsed() < earliest:
+            shutil.copyfile(p, provisional_path(sandbox))
+            state.early_submits += 1
+            return ToolResult(
+                f"submission is valid and saved as provisional, but it is too early to finish: "
+                f"{state.elapsed() / 60:.1f} of {budget.time_limit_s / 60:.0f} min used, submitting is allowed after "
+                f"{earliest / 60:.0f} min. Use the remaining time to improve your validation score (e.g. proper "
+                f"cross-validation, feature engineering, tuning, other model families, ensembling), then submit "
+                f"your best file. If time runs out, the provisional file is used.", error=True)
         shutil.copyfile(p, accepted_path(sandbox))
         state.submitted = str(p)
         return ToolResult("submission accepted. Episode finished.", done=True)
@@ -135,16 +172,19 @@ def compact(messages: list[dict], keep_last: int = 16, stub_chars: int = 400) ->
 
 class Agent:
     def __init__(self, llm: LLM, task: Task, sandbox: DockerSandbox, tracer: Tracer, budget: Budget,
-                 temperature: float = 0.7, seed: int | None = None):
+                 temperature: float = 0.7, seed: int | None = None, use_env_facts: bool = False):
         self.llm, self.task, self.sandbox, self.tracer, self.budget = llm, task, sandbox, tracer, budget
-        self.temperature, self.seed = temperature, seed
+        self.temperature, self.seed, self.use_env_facts = temperature, seed, use_env_facts
         self.state = EpisodeState()
         self.tools = make_tools(sandbox, task, self.state, budget)
 
     def _status(self) -> str:
         b, s = self.budget, self.state
+        gate = ""
+        if b.min_submit_frac and s.elapsed() < b.min_submit_frac * b.time_limit_s:
+            gate = f", submit allowed after {b.min_submit_frac * b.time_limit_s / 60:.0f} min"
         return (f"[budget: step {s.step}/{b.max_steps}, {s.elapsed() / 60:.1f}/{b.time_limit_s / 60:.0f} min, "
-                f"context {s.prompt_tokens} tokens]")
+                f"context {s.prompt_tokens} tokens{gate}]")
 
     def _out_of_budget(self) -> str | None:
         b, s = self.budget, self.state
@@ -161,6 +201,11 @@ class Agent:
         gpu_note = f", GPU(s) {sb.gpus}" if sb.gpus else ", no GPU"
         system = SYSTEM.format(cpus=sb.cpus, memory=sb.memory, gpu_note=gpu_note,
                                time_limit_min=int(self.budget.time_limit_s / 60), max_steps=self.budget.max_steps)
+        if self.budget.min_submit_frac:
+            system += (f"\n- submit is only accepted after {self.budget.min_submit_frac:.0%} of the time budget; "
+                       "earlier valid submissions are kept as provisional. Use the time to improve.")
+        if self.use_env_facts:
+            system += env_facts(sb)
         files = sorted(p.name for p in self.task.public_dir.iterdir())
         user = f"{self.task.description}\n\nFiles in /data: {', '.join(files)}"
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
@@ -222,6 +267,9 @@ class Agent:
     def _finish(self, stop_reason: str) -> dict:
         final = accepted_path(self.sandbox)
         source = "submit" if final.exists() else None
+        if source is None and provisional_path(self.sandbox).exists():
+            shutil.copyfile(provisional_path(self.sandbox), final)
+            source = "provisional"
         if source is None:
             # budget ran out: fall back to what the agent left behind, but only if it validates
             fallback = self.sandbox.workdir / "submission.csv"
@@ -236,7 +284,7 @@ class Agent:
                 self.tracer.log("grade_error", error=str(e))
         return {"stop_reason": stop_reason, "score": score, "metric": self.task.metric,
                 "higher_is_better": self.task.higher_is_better, "valid_submission": final.exists(),
-                "submission_source": source,
+                "submission_source": source, "early_submits": self.state.early_submits,
                 "steps": self.state.step, "elapsed_s": round(self.state.elapsed(), 1),
                 "total_prompt_tokens": self.state.total_prompt_tokens,
                 "completion_tokens": self.state.completion_tokens}

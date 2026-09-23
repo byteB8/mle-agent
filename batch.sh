@@ -63,6 +63,6 @@ if sc:
           f"min={min(sc):.4f}  max={max(sc):.4f}")
 EOF
 
-# 5. release the GPU
-./serve.sh stop
+# 5. release the GPU (unless a caller such as sweep.sh owns the server)
+[ "${KEEP_SERVER:-0}" = 1 ] || ./serve.sh stop
 say "done"

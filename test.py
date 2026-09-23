@@ -190,6 +190,44 @@ class TestAgent(unittest.TestCase):
             self.assertIsNone(res["score"])
             self.assertFalse(res["valid_submission"])
 
+    def test_submit_gate_keeps_provisional(self):
+        # early valid submit is refused but kept; a later submit after the gate opens is accepted
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            task = make_task(d / "t")
+            (d / "work").mkdir()
+            pd.DataFrame({"id": [1, 2, 3, 4], "y": [.1, .9, .2, .8]}).to_csv(d / "work/submission.csv", index=False)
+            llm = ScriptedLLM([call("submit"), call("bash", command="sleep 0.6"), call("submit")])
+            budget = Budget(max_steps=10, time_limit_s=1.0, min_submit_frac=0.5)
+            with LocalSandbox("x", "img", d / "work", task.public_dir) as sb:
+                res = Agent(llm, task, sb, Tracer(None), budget).run()
+            self.assertEqual((res["stop_reason"], res["submission_source"], res["early_submits"]),
+                             ("submitted", "submit", 1))
+            self.assertIn("too early", llm.seen[1][-1]["content"])
+        # budget runs out after only early submits: the provisional file is graded
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            task = make_task(d / "t")
+            (d / "work").mkdir()
+            pd.DataFrame({"id": [1, 2, 3, 4], "y": [.1, .9, .2, .8]}).to_csv(d / "work/a.csv", index=False)
+            llm = ScriptedLLM([call("submit", path="a.csv"), call("bash", command="rm a.csv")])
+            budget = Budget(max_steps=2, time_limit_s=60, min_submit_frac=0.5)
+            with LocalSandbox("x", "img", d / "work", task.public_dir) as sb:
+                res = Agent(llm, task, sb, Tracer(None), budget).run()
+            self.assertEqual((res["submission_source"], res["score"]), ("provisional", 1.0))
+
+    def test_env_facts_in_system_prompt(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            task = make_task(d / "t")
+            llm = ScriptedLLM([call("bash", command="true")])
+            with LocalSandbox("x", "img", d / "work", task.public_dir) as sb:
+                Agent(llm, task, sb, Tracer(None), Budget(max_steps=1), use_env_facts=True).run()
+            system = llm.seen[0][0]["content"]
+            self.assertIn("Installed versions", system)
+            self.assertIn("pandas", system)
+            self.assertIn("inspect the installed signature", system)
+
     def test_compact_keeps_pairs_and_recent(self):
         msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
         for i in range(30):

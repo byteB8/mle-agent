@@ -29,13 +29,14 @@ def run_stats(run: Path) -> dict:
             "tool_errors": len(errs), "api_drift_errors": sum(bool(API_DRIFT.search(e["output"])) for e in errs),
             "used_cv": any(USES_CV.search(e["args"]) for e in tools),
             "files_written": len(set(writes)), "submit_calls": sum(e["name"] == "submit" for e in tools),
+            "early_submits": res.get("early_submits", 0), "source": res.get("submission_source"),
             "tokens": res["total_prompt_tokens"] + res["completion_tokens"]}
 
 
 def main() -> None:
     rows = [run_stats(Path(p)) for p in sys.argv[1:] if (Path(p) / "result.json").exists()]
     cols = ["run", "test", "last_val", "steps", "time_s", "stop", "tool_errors", "api_drift_errors",
-            "used_cv", "files_written", "submit_calls", "tokens"]
+            "used_cv", "files_written", "submit_calls", "early_submits", "source", "tokens"]
     print(" | ".join(cols))
     for r in rows:
         print(" | ".join(f"{r[c]:.4f}" if isinstance(r[c], float) else str(r[c]) for c in cols))

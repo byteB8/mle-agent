@@ -32,6 +32,9 @@ def main() -> None:
     ap.add_argument("--memory", default="32g")
     ap.add_argument("--gpus", default=None, help="GPU index for the sandbox, or 'auto' (highest free index)")
     ap.add_argument("--image", default="exp-rt:cpu")
+    ap.add_argument("--min-submit-frac", type=float, default=0.0,
+                    help="reject submit before this fraction of the time budget (0 = off)")
+    ap.add_argument("--env-facts", action="store_true", help="put installed library versions in the prompt")
     args = ap.parse_args()
 
     if args.gpus == "auto":
@@ -42,14 +45,16 @@ def main() -> None:
     out.mkdir(parents=True)
     (out / "args.json").write_text(json.dumps(vars(args), indent=2))
 
-    budget = Budget(max_steps=args.max_steps, time_limit_s=args.time_limit_min * 60)
+    budget = Budget(max_steps=args.max_steps, time_limit_s=args.time_limit_min * 60,
+                    min_submit_frac=args.min_submit_frac)
     tracer = Tracer(out / "trace.jsonl")
     sandbox = DockerSandbox(name=f"exp-{run_id}"[:60], image=args.image, workdir=out / "work",
                             data_dir=task.public_dir, cpus=args.cpus, memory=args.memory, gpus=args.gpus)
     llm = LLM(args.base_url, args.model)
     try:
         with sandbox:
-            result = Agent(llm, task, sandbox, tracer, budget, temperature=args.temperature, seed=args.seed).run()
+            result = Agent(llm, task, sandbox, tracer, budget, temperature=args.temperature, seed=args.seed,
+                           use_env_facts=args.env_facts).run()
     finally:
         tracer.close()
     result["run_id"] = run_id
