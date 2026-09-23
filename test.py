@@ -285,6 +285,16 @@ class TestAgent(unittest.TestCase):
                 res = Agent(llm, task, sb, Tracer(None), budget).run()
             self.assertEqual((res["submission_source"], res["score"]), ("provisional", 1.0))
 
+    def test_loop_detection_warns_then_stops(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            task = make_task(d / "t")
+            llm = ScriptedLLM([call("bash", command="echo same")] * 12)
+            with LocalSandbox("x", "img", d / "work", task.public_dir) as sb:
+                res = Agent(llm, task, sb, Tracer(None), Budget(max_steps=50, loop_warn=3, loop_stop=6)).run()
+            self.assertEqual((res["stop_reason"], res["steps"]), ("loop_detected", 6))
+            self.assertIn("identical tool call 3 times", llm.seen[3][-1]["content"])
+
     def test_env_facts_in_system_prompt(self):
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)

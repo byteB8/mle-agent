@@ -45,6 +45,8 @@ class Budget:
     context_tokens: int = 60_000        # compact history above this prompt size
     cmd_timeout_s: int = 900
     min_submit_frac: float = 0.0        # reject `submit` before this fraction of wall-clock is used
+    loop_warn: int = 5                  # identical consecutive tool calls before an intervention message
+    loop_stop: int = 10                 # ... before the episode is stopped
 
 
 @dataclass
@@ -213,6 +215,7 @@ class Agent:
                         system=system, user=user)
 
         stop_reason, idle = None, 0
+        last_call, repeats = None, 0
         while not (stop_reason := self._out_of_budget()):
             if self.state.prompt_tokens > self.budget.context_tokens:
                 removed = compact(messages)
@@ -245,6 +248,13 @@ class Agent:
                 continue
             idle = 0
             self.state.step += 1
+            signature = [(c["function"]["name"], c["function"]["arguments"]) for c in calls]
+            repeats = repeats + 1 if signature == last_call else 1
+            last_call = signature
+            if repeats >= self.budget.loop_stop:
+                self.tracer.log("loop", step=self.state.step, repeats=repeats, action="stop")
+                stop_reason = "loop_detected"
+                break
 
             done = False
             for call in calls:
@@ -256,6 +266,12 @@ class Agent:
                 messages.append({"role": "tool", "tool_call_id": call["id"],
                                  "content": f"{res.text}\n{self._status()}"})
                 done = done or res.done
+            if repeats >= self.budget.loop_warn and not done:
+                self.tracer.log("loop", step=self.state.step, repeats=repeats, action="warn")
+                messages.append({"role": "user", "content": (
+                    f"You have made the identical tool call {repeats} times in a row and it keeps producing the same "
+                    "result. Repeating it will not change anything. Read the last tool result carefully and do "
+                    "something different.")})
             if done:
                 stop_reason = "submitted"
                 break
