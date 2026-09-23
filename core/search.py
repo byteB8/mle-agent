@@ -218,7 +218,8 @@ class TreeSearchAgent:
     def _run_node(self, node: Node) -> None:
         rel = f"nodes/{node.id}"
         self.sandbox.write_file(f"{rel}/solution.py", node.code)
-        timeout = int(max(10, min(self.cfg.node_timeout_s, self._remaining())))
+        # a node may not eat into the time kept back for the final refit
+        timeout = int(max(10, min(self.cfg.node_timeout_s, self._remaining() - self._final_reserve())))
         r = self.sandbox.exec(f"cd {rel} && python solution.py", timeout=timeout)  # cwd is /work
         node.exec_s = r.duration
         node.output = r.output
