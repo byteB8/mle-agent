@@ -40,6 +40,8 @@ def main() -> None:
     ap.add_argument("--num-drafts", type=int, default=3, help="tree: initial independent drafts")
     ap.add_argument("--debug-prob", type=float, default=0.5, help="tree: chance to debug a broken leaf")
     ap.add_argument("--node-timeout", type=int, default=600, help="tree: seconds per solution script")
+    ap.add_argument("--self-valid", action="store_true",
+                    help="tree: trust the script's printed VALIDATION_SCORE instead of a harness-held split")
     args = ap.parse_args()
 
     if args.gpus == "auto":
@@ -60,7 +62,7 @@ def main() -> None:
         with sandbox:
             if args.agent == "tree":
                 cfg = SearchConfig(num_drafts=args.num_drafts, debug_prob=args.debug_prob,
-                                   node_timeout_s=args.node_timeout)
+                                   node_timeout_s=args.node_timeout, harness_valid=not args.self_valid)
                 agent = TreeSearchAgent(llm, task, sandbox, tracer, budget, cfg, temperature=args.temperature,
                                         seed=args.seed, use_env_facts=args.env_facts)
             else:

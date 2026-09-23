@@ -192,6 +192,60 @@ class TestTreeSearch(unittest.TestCase):
         self.assertEqual(res["best_node"], 0)
 
 
+def make_split_task(root: Path) -> Task:
+    """Tabular task whose train.csv carries the label, so the harness can hold out validation rows.
+    Label is exactly x > 0, so an honest script is perfect and a 'leaky' one can only lie."""
+    import numpy as np
+    rng = np.random.default_rng(0)
+    (root / "public").mkdir(parents=True)
+    (root / "private").mkdir()
+    x = rng.normal(size=60)
+    train = pd.DataFrame({"id": range(60), "x": x, "y": (x > 0).astype(int)})
+    xt = rng.normal(size=20)
+    train.to_csv(root / "public/train.csv", index=False)
+    pd.DataFrame({"id": range(100, 120), "x": xt}).to_csv(root / "public/test.csv", index=False)
+    pd.DataFrame({"id": range(100, 120), "y": 0.5}).to_csv(root / "public/sample_submission.csv", index=False)
+    pd.DataFrame({"id": range(100, 120), "y": (xt > 0).astype(int)}).to_csv(root / "private/answers.csv", index=False)
+    (root / "task.json").write_text(json.dumps({"metric": "auc", "id_col": "id", "target_cols": ["y"],
+                                                "higher_is_better": True}))
+    (root / "description.md").write_text("predict y from x")
+    return Task.load(root)
+
+
+SCRIPT = """import pandas as pd
+tr = pd.read_csv('/work/input/train.csv'.replace('/work/', '../../'))
+for src, dst in [('valid', 'valid_predictions.csv'), ('test', 'submission.csv')]:
+    df = pd.read_csv(f'../../input/{{src}}.csv')
+    pd.DataFrame({{'id': df['id'], 'y': {pred}}}).to_csv(dst, index=False)
+print('VALIDATION_SCORE: {claim}')
+print('train rows', len(tr))
+"""
+
+
+class TestHarnessValidation(unittest.TestCase):
+    def test_leaky_self_report_loses_to_honest_script(self):
+        d = Path(tempfile.mkdtemp())
+        task = make_split_task(d / "t")
+        turns = [reply("leaky: claims 0.99, predicts anti-signal", SCRIPT.format(pred="-df['x']", claim=0.99)),
+                 reply("honest", SCRIPT.format(pred="df['x']", claim=0.5))]
+        tracer = Tracer(d / "trace.jsonl")
+        with LocalSandbox("x", "img", d / "work", task.public_dir) as sb:
+            agent = TreeSearchAgent(ScriptedLLM(turns), task, sb, tracer, Budget(max_steps=2, time_limit_s=300),
+                                    SearchConfig(num_drafts=2), seed=0)
+            res = agent.run()
+        tracer.close()
+        self.assertEqual(res["val_mode"], "harness")
+        self.assertEqual((agent.nodes[0].self_score, agent.nodes[0].score), (0.99, 0.0))
+        self.assertEqual(agent.nodes[1].score, 1.0)
+        self.assertEqual((res["best_node"], res["score"], res["submission_source"]), (1, 1.0, "tree_best_refit"))
+        # labels never reach the sandbox; the refit saw the full training set
+        self.assertNotIn("y", pd.read_csv(d / "work/input/valid.csv").columns)
+        self.assertEqual(len(pd.read_csv(d / "work/input/train.csv")), 60)
+        refit = [e for e in read_trace(d / "trace.jsonl") if e["kind"] == "final_refit"][0]
+        self.assertIn("train rows 60", refit["output"])
+        self.assertTrue((d / "valid_labels.csv").exists())
+
+
 class TestAgent(unittest.TestCase):
     def test_episode_end_to_end(self):
         with tempfile.TemporaryDirectory() as d:
