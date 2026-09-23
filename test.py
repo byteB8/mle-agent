@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -14,6 +16,7 @@ from core.agent import Agent, Budget, compact
 from core.gpu import parse_free
 from core.llm import Completion, _normalise
 from core.sandbox import DockerSandbox, ExecResult, truncate
+from core.search import SearchConfig, TreeSearchAgent
 from core.tasks import Task
 from core.tools import Tool, ToolRegistry
 from core.trace import Tracer, read_trace
@@ -29,8 +32,9 @@ class LocalSandbox(DockerSandbox):
 
     def exec(self, command, timeout=600):
         t0 = time.monotonic()
+        env = {**os.environ, "PATH": f"{Path(sys.executable).parent}:{os.environ['PATH']}"}  # `python` = this one
         r = subprocess.run(["bash", "-c", command], cwd=self.workdir, stdout=subprocess.PIPE,
-                           stderr=subprocess.STDOUT, timeout=timeout)
+                           stderr=subprocess.STDOUT, timeout=timeout, env=env)
         return ExecResult(r.returncode, r.stdout.decode(), False, time.monotonic() - t0)
 
 
@@ -121,6 +125,71 @@ class TestTask(unittest.TestCase):
             pd.DataFrame({"id": [1, 2, 3], "pred": [0, 0, 0]}).to_csv(sub, index=False)
             errs = task.validate_submission(sub)
             self.assertTrue(any("columns" in e for e in errs) and any("rows" in e for e in errs))
+
+
+def reply(plan, code=None):
+    body = plan if code is None else f"{plan}\n```python\n{code}\n```"
+    return {"role": "assistant", "content": body}
+
+
+GOOD = """import pandas as pd
+pd.DataFrame({{'id': [1, 2, 3, 4], 'y': {preds}}}).to_csv('submission.csv', index=False)
+print('VALIDATION_SCORE: {val}')
+"""
+
+
+class TestTreeSearch(unittest.TestCase):
+    def run_tree(self, turns, max_steps, **cfg):
+        d = Path(tempfile.mkdtemp())
+        task = make_task(d / "t")
+        llm = ScriptedLLM(turns)
+        tracer = Tracer(d / "trace.jsonl")
+        with LocalSandbox("x", "img", d / "work", task.public_dir) as sb:
+            agent = TreeSearchAgent(llm, task, sb, tracer, Budget(max_steps=max_steps, time_limit_s=300),
+                                    SearchConfig(**cfg), seed=0)
+            res = agent.run()
+        tracer.close()
+        return res, agent, llm, read_trace(d / "trace.jsonl")
+
+    def test_drafts_then_improve_best_and_pick_by_validation(self):
+        turns = [
+            reply("draft A: crashes", "raise SystemExit(3)"),
+            reply("draft B: ok", GOOD.format(preds=[.9, .1, .8, .2], val=0.60)),   # val 0.60, test AUC 0.0
+            reply("draft C: no code"),
+            reply("improve B", GOOD.format(preds=[.1, .9, .2, .8], val=0.95)),      # val 0.95, test AUC 1.0
+        ]
+        res, agent, llm, trace = self.run_tree(turns, max_steps=4, num_drafts=3, debug_prob=0.0)
+        self.assertEqual([n.op for n in agent.nodes], ["draft", "draft", "draft", "improve"])
+        self.assertEqual(agent.nodes[3].parent, 1)                 # improved the best valid node
+        self.assertIn("exit 3", agent.nodes[0].error)
+        self.assertIn("no ```python", agent.nodes[2].error)
+        self.assertEqual((res["best_node"], res["best_val"], res["score"]), (3, 0.95, 1.0))
+        self.assertEqual((res["nodes"], res["buggy_nodes"]), (4, 2))
+        self.assertIn("node 1 [draft] score 0.60000", llm.seen[3][1]["content"])  # memory of attempts
+        self.assertEqual(sum(e["kind"] == "node" for e in trace), 4)
+
+    def test_debug_and_validation_failures(self):
+        turns = [
+            reply("draft: forgets score line", "import pandas as pd\n"
+                  "pd.DataFrame({'id':[1,2,3,4],'y':[.1,.9,.2,.8]}).to_csv('submission.csv', index=False)"),
+            reply("fix: add score", GOOD.format(preds=[.1, .9, .2, .8], val=0.9)),
+        ]
+        res, agent, _, _ = self.run_tree(turns, max_steps=2, num_drafts=1, debug_prob=1.0)
+        self.assertEqual(agent.nodes[0].error, "no VALIDATION_SCORE line printed")
+        self.assertEqual((agent.nodes[1].op, agent.nodes[1].parent, agent.nodes[1].debug_depth), ("debug", 0, 1))
+        self.assertEqual(res["score"], 1.0)
+
+    def test_higher_is_better_false_picks_minimum(self):
+        turns = [reply("a", GOOD.format(preds=[.1, .9, .2, .8], val=0.3)),
+                 reply("b", GOOD.format(preds=[.9, .1, .8, .2], val=0.5))]
+        d = Path(tempfile.mkdtemp())
+        task = make_task(d / "t")
+        task.higher_is_better = False
+        with LocalSandbox("x", "img", d / "work", task.public_dir) as sb:
+            agent = TreeSearchAgent(ScriptedLLM(turns), task, sb, Tracer(None), Budget(max_steps=2, time_limit_s=300),
+                                    SearchConfig(num_drafts=2), seed=0)
+            res = agent.run()
+        self.assertEqual(res["best_node"], 0)
 
 
 class TestAgent(unittest.TestCase):

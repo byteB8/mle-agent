@@ -21,7 +21,8 @@ quality vs. cost against the large model.
 | `core/llm.py` | raw HTTP client for `/v1/chat/completions`: retries/backoff, tool-call normalisation, token accounting |
 | `core/tools.py` | tool registry: JSON-schema definitions, argument validation/coercion, errors returned to the model |
 | `core/sandbox.py` | Docker sandbox: read-only data, no network, CPU/mem/pid limits, in-container kill on timeout |
-| `core/agent.py` | agent loop: budgets (steps, wall-clock, tokens), context compaction, submission validation |
+| `core/search.py` | solution-tree search agent: draft / improve / debug nodes, each a full script run and scored by the harness |
+| `core/agent.py` | ReAct baseline agent loop: budgets (steps, wall-clock, tokens), context compaction, submission validation |
 | `core/tasks.py` | task spec, submission format checks, graders |
 | `core/trace.py` | append-only JSONL trace of every LLM and tool call |
 | `run.py` / `prep.py` / `test.py` | run one episode / build task dirs / unit tests (no GPU or LLM needed) |

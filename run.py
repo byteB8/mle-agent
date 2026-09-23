@@ -13,6 +13,7 @@ from core.agent import Agent, Budget
 from core.gpu import pick_gpu
 from core.llm import LLM
 from core.sandbox import DockerSandbox
+from core.search import SearchConfig, TreeSearchAgent
 from core.tasks import Task
 from core.trace import Tracer
 
@@ -35,6 +36,10 @@ def main() -> None:
     ap.add_argument("--min-submit-frac", type=float, default=0.0,
                     help="reject submit before this fraction of the time budget (0 = off)")
     ap.add_argument("--env-facts", action="store_true", help="put installed library versions in the prompt")
+    ap.add_argument("--agent", choices=["react", "tree"], default="react")
+    ap.add_argument("--num-drafts", type=int, default=3, help="tree: initial independent drafts")
+    ap.add_argument("--debug-prob", type=float, default=0.5, help="tree: chance to debug a broken leaf")
+    ap.add_argument("--node-timeout", type=int, default=600, help="tree: seconds per solution script")
     args = ap.parse_args()
 
     if args.gpus == "auto":
@@ -53,8 +58,15 @@ def main() -> None:
     llm = LLM(args.base_url, args.model)
     try:
         with sandbox:
-            result = Agent(llm, task, sandbox, tracer, budget, temperature=args.temperature, seed=args.seed,
-                           use_env_facts=args.env_facts).run()
+            if args.agent == "tree":
+                cfg = SearchConfig(num_drafts=args.num_drafts, debug_prob=args.debug_prob,
+                                   node_timeout_s=args.node_timeout)
+                agent = TreeSearchAgent(llm, task, sandbox, tracer, budget, cfg, temperature=args.temperature,
+                                        seed=args.seed, use_env_facts=args.env_facts)
+            else:
+                agent = Agent(llm, task, sandbox, tracer, budget, temperature=args.temperature, seed=args.seed,
+                              use_env_facts=args.env_facts)
+            result = agent.run()
     finally:
         tracer.close()
     result["run_id"] = run_id
