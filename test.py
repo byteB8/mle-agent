@@ -16,7 +16,7 @@ from core.agent import Agent, Budget, compact
 from core.gpu import parse_free
 from core.llm import Completion, _normalise
 from core.sandbox import DockerSandbox, ExecResult, truncate
-from core.search import SearchConfig, TreeSearchAgent
+from core.search import Lesson, SearchConfig, TreeSearchAgent
 from core.tasks import Task
 from core.tools import Tool, ToolRegistry
 from core.trace import Tracer, read_trace
@@ -220,6 +220,35 @@ for src, dst in [('valid', 'valid_predictions.csv'), ('test', 'submission.csv')]
 print('VALIDATION_SCORE: {claim}')
 print('train rows', len(tr))
 """
+
+
+class TestLessons(unittest.TestCase):
+    def test_fix_found_in_one_branch_reaches_later_prompts(self):
+        bad = "raise TypeError(\"train() got an unexpected keyword argument 'early_stopping_rounds'\")"
+        turns = [reply("draft", bad),
+                 reply("draft 2", GOOD.format(preds=[.1, .9, .2, .8], val=0.8)),
+                 reply("Use callbacks=[lgb.early_stopping(50)] instead of early_stopping_rounds.",
+                       GOOD.format(preds=[.1, .9, .2, .8], val=0.9)),     # debug fixes node 0
+                 reply("improve", GOOD.format(preds=[.1, .9, .2, .8], val=0.95))]
+        d = Path(tempfile.mkdtemp())
+        task = make_task(d / "t")
+        llm = ScriptedLLM(turns)
+        with LocalSandbox("x", "img", d / "work", task.public_dir) as sb:
+            agent = TreeSearchAgent(llm, task, sb, Tracer(None), Budget(max_steps=4, time_limit_s=300),
+                                    SearchConfig(num_drafts=2, debug_prob=1.0, lessons=True), seed=0)
+            res = agent.run()
+        self.assertEqual([n.op for n in agent.nodes], ["draft", "draft", "debug", "improve"])
+        self.assertNotIn("Known pitfalls", llm.seen[1][1]["content"])  # one unfixed hit: not a lesson yet
+        last_prompt = llm.seen[3][1]["content"]
+        self.assertIn("Known pitfalls", last_prompt)
+        self.assertIn("unexpected keyword argument 'early_stopping_rounds'", last_prompt)
+        self.assertIn("callbacks=[lgb.early_stopping(50)]", last_prompt)
+        self.assertEqual(len(res["lessons"]), 1)
+
+    def test_off_by_default(self):
+        agent = TreeSearchAgent(None, None, None, Tracer(None), Budget())
+        agent.lessons["x"] = Lesson("x", count=5, fix="y")
+        self.assertEqual(agent._pitfalls(), "")
 
 
 class TestHarnessValidation(unittest.TestCase):

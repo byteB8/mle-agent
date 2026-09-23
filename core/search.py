@@ -90,6 +90,24 @@ class Node:
         return f"- node {self.id} [{self.op}{'' if self.parent is None else f' of {self.parent}'}] {res}: {self.plan[:200]}"
 
 
+def error_signature(error: str) -> str:
+    """Stable key for an error: the exception line with numbers masked, e.g.
+    "TypeError: train() got an unexpected keyword argument 'early_stopping_rounds'"."""
+    line = re.sub(r"^exit \d+: ", "", error.strip())
+    return re.sub(r"\d+", "N", line)[:160]
+
+
+@dataclass
+class Lesson:
+    signature: str
+    count: int = 1              # how many nodes hit it
+    fix: str = ""               # how a debug node got past it (the model's own explanation), if any
+
+    def render(self) -> str:
+        how = f" Fix that worked: {self.fix}" if self.fix else " (no working fix found yet)"
+        return f"- `{self.signature}` (hit by {self.count} script(s)).{how}"
+
+
 @dataclass
 class SearchConfig:
     num_drafts: int = 3
@@ -99,6 +117,9 @@ class SearchConfig:
     max_memory_nodes: int = 15      # how many earlier attempts are summarised in a draft/improve prompt
     harness_valid: bool = True      # harness holds out and scores a validation split (when the task allows it)
     valid_frac: float = 0.2
+    lessons: bool = False           # share error->fix lessons across branches
+    max_lessons: int = 8
+    lesson_min_count: int = 2       # an unfixed error becomes a lesson once this many nodes hit it
 
 
 class TreeSearchAgent:
@@ -113,6 +134,7 @@ class TreeSearchAgent:
         self.nodes: list[Node] = []
         self.data_preview = ""
         self.valid_labels = None    # set in harness-valid mode; never written under /work
+        self.lessons: dict[str, Lesson] = {}
 
     # ---------- scoring ----------
     def _better(self, a: float, b: float) -> bool:
@@ -146,8 +168,33 @@ class TreeSearchAgent:
         done = self.nodes[-self.cfg.max_memory_nodes:]
         return "\n".join(n.summary() for n in done) if done else "(none yet)"
 
+    def _learn(self, node: Node) -> None:
+        """Update lessons after a node ran: count failures, and record the fix when a debug node succeeds."""
+        if node.buggy and node.error:
+            sig = error_signature(node.error)
+            if sig in self.lessons:
+                self.lessons[sig].count += 1
+            else:
+                self.lessons[sig] = Lesson(sig)
+        if node.op == "debug" and not node.buggy:
+            parent = self.nodes[node.parent]
+            lesson = self.lessons.get(error_signature(parent.error))
+            if lesson is not None and not lesson.fix:
+                lesson.fix = " ".join(node.plan.split())[:300]
+
+    def _pitfalls(self) -> str:
+        if not self.cfg.lessons:
+            return ""
+        shown = [l for l in self.lessons.values() if l.fix or l.count >= self.cfg.lesson_min_count]
+        shown = sorted(shown, key=lambda l: (not l.fix, -l.count))[:self.cfg.max_lessons]
+        if not shown:
+            return ""
+        return ("\n# Known pitfalls in this environment (learned from earlier scripts; avoid them)\n"
+                + "\n".join(l.render() for l in shown) + "\n")
+
     def _prompt(self, op: str, parent: Node | None) -> str:
-        head = f"# Task\n{self.task.description}\n\n# Data preview\n{self.data_preview}\n"
+        head = (f"# Task\n{self.task.description}\n\n# Data preview\n{self.data_preview}\n"
+                + self._pitfalls())
         if op == "draft":
             return (head + f"\n# Earlier attempts\n{self._memory()}\n\n"
                     "Write a NEW solution. Prefer an approach that differs from the earlier attempts; "
@@ -233,6 +280,7 @@ class TreeSearchAgent:
             node.error = "no ```python code block in the reply"
             node.output = f"[harness] {node.error}"
         self.nodes.append(node)
+        self._learn(node)
         best = self.best()
         self.tracer.log("node", step=self.state.step, id=node.id, parent=node.parent, op=op, plan=node.plan,
                         code=node.code, output=truncate(node.output, 4000), score=node.score,
@@ -335,4 +383,5 @@ class TreeSearchAgent:
                 "nodes": len(self.nodes), "buggy_nodes": sum(n.buggy for n in self.nodes),
                 "ops": {o: ops.count(o) for o in ("draft", "improve", "debug")},
                 "best_node": best.id if best else None, "best_val": best.score if best else None,
-                "best_self_val": best.self_score if best else None}
+                "best_self_val": best.self_score if best else None,
+                "lessons": [vars(l) for l in self.lessons.values() if l.fix or l.count >= self.cfg.lesson_min_count]}
