@@ -29,6 +29,7 @@ quality vs. cost against the large model.
 | `serve.sh` / `main.py` | start/stop vLLM (own venv, runs as the user) on the highest free GPU or a given one; generic process title |
 | `setup.sh` | one-time server setup: vLLM venv, CUDA forward-compat libs, model weights (no root) |
 | `batch.sh` | unattended multi-seed run: start server, run seeds in parallel, summarise, release GPU |
+| `suite.sh` | arms over a suite of tasks, every (task, seed) in parallel |
 | `sweep.sh` | several experiment arms back to back on one server (ablations) |
 | `stats.py` | per-run behaviour stats from traces (errors, CV use, early submits, tokens) |
 | `env/Dockerfile` | sandbox runtime image |
@@ -40,6 +41,7 @@ quality vs. cost against the large model.
 ./serve.sh                            # vLLM on highest free GPU (3>2>1>0), localhost:8011
 docker build -t exp-rt:cpu env/       # sandbox image
 python prep.py dev-adult --out data   # smoke-test task
+python prep.py all-kaggle --raw ../kaggle_raw   # 6 MLE-bench Lite competitions, re-split (needs Kaggle downloads)
 python run.py --task data/dev-adult --time-limit-min 30
 python test.py
 ```

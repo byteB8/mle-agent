@@ -16,5 +16,5 @@ for arm in "$@"; do
   KEEP_SERVER=1 ./batch.sh "$TASK" "$tag" "$SEEDS" $args
   echo "  $tag: $(grep "valid  mean=" "logs/batch-${tag}.log" | tail -1)" >>"$LOG"
 done
-./serve.sh stop >>"$LOG" 2>&1
+./serve.sh stop "${PORT:-8011}" >>"$LOG" 2>&1
 say "sweep done"

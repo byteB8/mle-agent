@@ -12,32 +12,14 @@ LOG=logs/batch-${TAG}.log
 exec >>"$LOG" 2>&1
 say() { echo "[$(date '+%F %T')] $*"; }
 
-# 1. wait for any in-flight venv install, retry once if vllm is still missing
-while pgrep -u "$(id -un)" -f "venv/bin/pip install" >/dev/null; do sleep 30; done
-if ! venv/bin/python -c "import vllm" 2>/dev/null; then
-  say "vllm missing, retrying install"
-  TMPDIR=$PWD/tmp PIP_CACHE_DIR=$PWD/tmp/pipcache \
-    venv/bin/pip install --timeout 180 --retries 10 --progress-bar off vllm==0.30.0 >>logs/venv.log 2>&1
-  venv/bin/python -c "import vllm" || { say "FAILED: vllm not installable"; exit 1; }
-fi
-say "vllm $(venv/bin/python -c 'import vllm;print(vllm.__version__)') ready"
-
-# 2. start the server unless it is already answering
-if ! curl -sf "http://127.0.0.1:${PORT}/v1/models" >/dev/null; then
-  ./serve.sh "${GPU:-auto}" "$PORT"   # GPU=<index> pins the server to one GPU
-  for _ in $(seq 1 120); do
-    curl -sf "http://127.0.0.1:${PORT}/v1/models" >/dev/null && break
-    kill -0 "$(cat logs/srv.pid)" 2>/dev/null || { say "FAILED: server died"; tail -30 logs/srv.log; exit 1; }
-    sleep 10
-  done
-  curl -sf "http://127.0.0.1:${PORT}/v1/models" >/dev/null || { say "FAILED: server not ready in 20 min"; exit 1; }
-fi
+# 1. make sure the server is up (GPU=<index> pins it to one GPU; default: highest free)
+./serve.sh ensure "${GPU:-auto}" "$PORT" || { say "FAILED: server did not come up"; exit 1; }
 say "server up; GPU processes and owners:"
 nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader | while IFS=, read -r pid mem; do
   echo "  pid $pid user $(ps -o user= -p "$pid") mem$mem"
 done
 
-# 3. run seeds in parallel, each in its own sandbox
+# 2. run seeds in parallel, each in its own sandbox
 pids=()
 for s in $SEEDS; do
   "$PY" run.py --task "$TASK" --tag "$TAG" --seed "$s" --base-url "http://127.0.0.1:${PORT}/v1" "$@" \
@@ -48,7 +30,7 @@ done
 say "launched seeds: $SEEDS"
 for p in "${pids[@]}"; do wait "$p"; done
 
-# 4. summary
+# 3. summary
 say "summary:"
 "$PY" - "$TAG" <<'EOF'
 import glob, json, sys, statistics as st
@@ -63,6 +45,6 @@ if sc:
           f"min={min(sc):.4f}  max={max(sc):.4f}")
 EOF
 
-# 5. release the GPU (unless a caller such as sweep.sh owns the server)
-[ "${KEEP_SERVER:-0}" = 1 ] || ./serve.sh stop
+# 4. release the GPU (unless a caller such as sweep.sh owns the server)
+[ "${KEEP_SERVER:-0}" = 1 ] || ./serve.sh stop "$PORT"
 say "done"
