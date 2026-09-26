@@ -54,7 +54,8 @@ def main() -> None:
     rows = [run_stats(Path(p)) for p in sys.argv[1:] if (Path(p) / "result.json").exists()]
     if rows and "nodes" in rows[0]:
         for r in rows:
-            print(f"{r['run']}: test={r['test']:.4f} best_val={r['best_val']:.4f} nodes={r['nodes']} "
+            fmt = lambda v: "none" if v is None else f"{v:.4f}"
+            print(f"{r['run']}: test={fmt(r['test'])} best_val={fmt(r['best_val'])} nodes={r['nodes']} "
                   f"buggy={r['buggy']} ops={r['ops']} best_node={r['best_node']} api_drift_nodes={r['api_drift_nodes']} "
                   f"median_exec={r['median_exec_s']}s tokens={r['tokens']}")
             print(f"    top vals {r['top_vals']}")
@@ -62,8 +63,9 @@ def main() -> None:
                 print(f"    {k} x {err}")
         sc = [r["test"] for r in rows if r["test"] is not None]
         gap = [r["best_val"] - r["test"] for r in rows if r["test"] is not None]
-        print(f"\nn={len(sc)} mean={st.mean(sc):.4f} sd={st.pstdev(sc):.4f} "
-              f"mean(best_val - test)={st.mean(gap):+.4f} buggy_rate="
+        summary = (f"n={len(sc)} mean={st.mean(sc):.4f} sd={st.pstdev(sc):.4f} mean(best_val - test)={st.mean(gap):+.4f}"
+                   if sc else "n=0 valid")
+        print(f"\n{summary} buggy_rate="
               f"{sum(r['buggy'] for r in rows) / sum(r['nodes'] for r in rows):.2f}")
         return
     cols = ["run", "test", "last_val", "steps", "time_s", "stop", "tool_errors", "api_drift_errors",
