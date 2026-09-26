@@ -1,7 +1,9 @@
 """Task spec, submission validation and grading.
 
 Layout of a task directory:
-    task.json            {"metric", "id_col", "target_cols", "higher_is_better"}
+    task.json            {"metric", "id_col", "target_cols", "higher_is_better"} and optionally
+                         "label_col" (train holds one class-label column; answers are one-hot over target_cols),
+                         "train_file" / "test_file" (default train.csv / test.csv; .csv or .json records)
     description.md       what the agent is told
     public/              mounted read-only at /data (train, test, sample_submission.csv)
     private/answers.csv  held-out labels; never mounted into the sandbox
@@ -16,6 +18,17 @@ import numpy as np
 import pandas as pd
 
 
+def read_table(path: Path) -> pd.DataFrame:
+    return pd.read_json(path) if path.suffix == ".json" else pd.read_csv(path)
+
+
+def write_table(df: pd.DataFrame, path: Path) -> None:
+    if path.suffix == ".json":
+        df.to_json(path, orient="records", indent=1)
+    else:
+        df.to_csv(path, index=False)
+
+
 def _metric(name: str, y_true: pd.DataFrame, y_pred: pd.DataFrame, target_cols: list[str]) -> float:
     from sklearn import metrics as M
     if name == "auc":
@@ -24,6 +37,9 @@ def _metric(name: str, y_true: pd.DataFrame, y_pred: pd.DataFrame, target_cols: 
         return float(M.accuracy_score(y_true[target_cols[0]].astype(str), y_pred[target_cols[0]].astype(str)))
     if name == "rmse":
         return float(np.sqrt(M.mean_squared_error(y_true[target_cols], y_pred[target_cols])))
+    if name == "rmsle_mean":  # column-wise RMSLE, averaged over target columns
+        return float(np.mean([np.sqrt(M.mean_squared_log_error(y_true[c], np.clip(y_pred[c], 0, None)))
+                              for c in target_cols]))
     if name == "mae":
         return float(M.mean_absolute_error(y_true[target_cols], y_pred[target_cols]))
     if name == "logloss":  # multiclass: answers hold one-hot columns, submission holds probabilities
@@ -42,6 +58,9 @@ class Task:
     target_cols: list[str]
     higher_is_better: bool
     description: str
+    label_col: str | None = None
+    train_file: str = "train.csv"
+    test_file: str = "test.csv"
 
     @classmethod
     def load(cls, root: str | Path) -> "Task":
@@ -49,7 +68,8 @@ class Task:
         spec = json.loads((root / "task.json").read_text())
         return cls(name=root.name, root=root, metric=spec["metric"], id_col=spec["id_col"],
                    target_cols=list(spec["target_cols"]), higher_is_better=bool(spec["higher_is_better"]),
-                   description=(root / "description.md").read_text())
+                   description=(root / "description.md").read_text(), label_col=spec.get("label_col"),
+                   train_file=spec.get("train_file", "train.csv"), test_file=spec.get("test_file", "test.csv"))
 
     @property
     def public_dir(self) -> Path:
@@ -90,19 +110,29 @@ class Task:
 
     @property
     def can_split(self) -> bool:
-        """Whether train.csv carries the target columns directly, so the harness can hold out a validation split."""
-        train = self.public_dir / "train.csv"
-        if not train.exists():
+        """Whether the harness can hold out labelled validation rows from the public train file."""
+        train, test = self.public_dir / self.train_file, self.public_dir / self.test_file
+        if not (train.exists() and test.exists()):
             return False
-        cols = pd.read_csv(train, nrows=0).columns
-        return self.id_col in cols and all(c in cols for c in self.target_cols)
+        cols = read_table(train).columns
+        labels = [self.label_col] if self.label_col else self.target_cols
+        return self.id_col in cols and all(c in cols for c in labels)
 
     def split_train(self, seed: int, valid_frac: float = 0.2) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        """(train part with labels, valid features, valid labels) from the public train set."""
-        df = pd.read_csv(self.public_dir / "train.csv")
+        """(train part with labels, valid features, valid labels) from the public train file.
+        Valid features keep only the columns the test file has, so validation rows look like test rows
+        (e.g. no fields that are only known after the fact)."""
+        df = read_table(self.public_dir / self.train_file)
+        test_cols = read_table(self.public_dir / self.test_file).columns
         valid = df.sample(frac=valid_frac, random_state=seed)
         train = df.drop(valid.index)
-        return train, valid.drop(columns=self.target_cols), valid[[self.id_col] + self.target_cols]
+        valid_x = valid[[c for c in test_cols if c in valid.columns]]
+        if self.label_col:
+            onehot = pd.get_dummies(valid[self.label_col]).reindex(columns=self.target_cols, fill_value=0)
+            valid_y = pd.concat([valid[[self.id_col]], onehot.astype(int)], axis=1)
+        else:
+            valid_y = valid[[self.id_col] + self.target_cols]
+        return train, valid_x, valid_y
 
     def grade(self, path: Path, answers: pd.DataFrame | None = None) -> float:
         """Score a prediction file against the private test answers (default) or any given labels."""

@@ -251,6 +251,51 @@ class TestLessons(unittest.TestCase):
         self.assertEqual(agent._pitfalls(), "")
 
 
+class TestTaskFormats(unittest.TestCase):
+    def test_label_col_split_is_one_hot_and_test_shaped(self):
+        d = Path(tempfile.mkdtemp())
+        (d / "public").mkdir()
+        (d / "private").mkdir()
+        pd.DataFrame({"id": range(20), "text": list("abcdefghijklmnopqrst"), "votes_after": range(20),
+                      "author": ["A", "B", "C", "A"] * 5}).to_csv(d / "public/train.csv", index=False)
+        pd.DataFrame({"id": [100], "text": ["z"]}).to_csv(d / "public/test.csv", index=False)
+        pd.DataFrame({"id": [100], "A": [1 / 3], "B": [1 / 3], "C": [1 / 3]}).to_csv(
+            d / "public/sample_submission.csv", index=False)
+        (d / "task.json").write_text(json.dumps({"metric": "logloss", "id_col": "id", "target_cols": ["A", "B", "C"],
+                                                 "higher_is_better": False, "label_col": "author"}))
+        (d / "description.md").write_text("x")
+        task = Task.load(d)
+        self.assertTrue(task.can_split)
+        train, vx, vy = task.split_train(seed=0, valid_frac=0.25)
+        self.assertEqual(list(vx.columns), ["id", "text"])              # no label, no after-the-fact field
+        self.assertEqual(list(vy.columns), ["id", "A", "B", "C"])
+        self.assertTrue((vy[["A", "B", "C"]].sum(axis=1) == 1).all())
+        self.assertIn("author", train.columns)
+        perfect = vy.copy()
+        perfect.to_csv(d / "p.csv", index=False)
+        self.assertLess(task.grade(d / "p.csv", answers=vy), 1e-6)
+
+    def test_json_task_and_rmsle(self):
+        d = Path(tempfile.mkdtemp())
+        (d / "public").mkdir()
+        (d / "private").mkdir()
+        pd.DataFrame({"rid": ["a", "b", "c", "d", "e"], "f": range(5), "y": [0, 1, 0, 1, 1]}).to_json(
+            d / "public/train.json", orient="records")
+        pd.DataFrame({"rid": ["z"], "f": [9]}).to_json(d / "public/test.json", orient="records")
+        (d / "task.json").write_text(json.dumps({"metric": "auc", "id_col": "rid", "target_cols": ["y"],
+                                                 "higher_is_better": True, "train_file": "train.json",
+                                                 "test_file": "test.json"}))
+        (d / "description.md").write_text("x")
+        task = Task.load(d)
+        self.assertTrue(task.can_split)
+        _, vx, vy = task.split_train(seed=1, valid_frac=0.4)
+        self.assertEqual(list(vx.columns), ["rid", "f"])
+        from core.tasks import _metric
+        t = pd.DataFrame({"a": [1.0, 2.0], "b": [3.0, 4.0]})
+        self.assertAlmostEqual(_metric("rmsle_mean", t, t, ["a", "b"]), 0.0)
+        self.assertGreater(_metric("rmsle_mean", t, t * 2, ["a", "b"]), 0.1)
+
+
 class TestHarnessValidation(unittest.TestCase):
     def test_leaky_self_report_loses_to_honest_script(self):
         d = Path(tempfile.mkdtemp())

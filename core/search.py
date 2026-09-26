@@ -17,13 +17,12 @@ import random
 import re
 import shutil
 from dataclasses import dataclass, field
-
-import pandas as pd
+from pathlib import Path
 
 from .agent import Budget, EpisodeState, accepted_path, env_facts
 from .llm import LLM, LLMError
 from .sandbox import DockerSandbox, truncate
-from .tasks import Task
+from .tasks import Task, write_table
 from .trace import Tracer
 
 SCORE_RE = re.compile(r"VALIDATION_SCORE:\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)")
@@ -54,14 +53,14 @@ Every script you write is run by a harness as `python solution.py` in its own di
 - {cpus} CPUs, {memory} RAM{gpu_note}. The script must finish within {node_timeout} seconds or it is killed.
 
 Inputs (use exactly these paths):
-- /work/input/train.csv  labelled training data
-- /work/input/valid.csv  validation rows, features only: the harness holds the labels and scores your predictions
-- /work/input/test.csv   test rows, features only
+- /work/input/{train}  labelled training data
+- /work/input/{valid}  validation rows, features only: the harness holds the labels and scores your predictions
+- /work/input/{test}   test rows, features only
 - /data/sample_submission.csv  the required output format (other task files under /data are read-only)
 
 Requirements for every script:
-1. Train only on /work/input/train.csv (use internal cross-validation there if you want to tune).
-2. Write `valid_predictions.csv` (for valid.csv) and `submission.csv` (for test.csv) in the current directory, both
+1. Train only on /work/input/{train} (use internal cross-validation there if you want to tune).
+2. Write `valid_predictions.csv` (for {valid}) and `submission.csv` (for {test}) in the current directory, both
    with exactly the columns of /data/sample_submission.csv and the ids of the corresponding input file.
 3. The harness computes the official validation score ({metric}, {direction}) from valid_predictions.csv. You may
    print your own estimate as `VALIDATION_SCORE: <float>`, but it is not used. Keep printed output short.
@@ -310,22 +309,25 @@ class TreeSearchAgent:
         train, valid_x, valid_y = self.task.split_train(seed=self.seed or 0, valid_frac=self.cfg.valid_frac)
         inp = self.sandbox.host_path("input")
         inp.mkdir(parents=True, exist_ok=True)
-        train.to_csv(inp / "train.csv", index=False)
-        valid_x.to_csv(inp / "valid.csv", index=False)
-        shutil.copyfile(self.task.public_dir / "test.csv", inp / "test.csv")
+        write_table(train, inp / self.input_names["train"])
+        write_table(valid_x, inp / self.input_names["valid"])
+        shutil.copyfile(self.task.public_dir / self.task.test_file, inp / self.input_names["test"])
         valid_y.to_csv(self.sandbox.workdir.parent / "valid_labels.csv", index=False)  # audit copy, outside /work
         self.valid_labels = valid_y
 
     def run(self) -> dict:
         sb = self.sandbox
-        harness = self.cfg.harness_valid and self.task.can_split and (self.task.public_dir / "test.csv").exists()
+        ext = Path(self.task.train_file).suffix
+        self.input_names = {"train": f"train{ext}", "valid": f"valid{ext}", "test": f"test{Path(self.task.test_file).suffix}"}
+        harness = self.cfg.harness_valid and self.task.can_split
         if harness:
             self._setup_harness_valid()
         template = SYSTEM_HARNESS_VALID if harness else SYSTEM
         self.system = template.format(cpus=sb.cpus, memory=sb.memory,
                                     gpu_note=f", GPU(s) {sb.gpus}" if sb.gpus else ", no GPU",
                                     node_timeout=self.cfg.node_timeout_s, metric=self.task.metric,
-                                    direction="higher is better" if self.task.higher_is_better else "lower is better")
+                                    direction="higher is better" if self.task.higher_is_better else "lower is better",
+                                    **self.input_names)
         if self.use_env_facts:
             self.system += env_facts(sb)
         where = "/work/input/* /data/sample_submission.csv" if harness else "/data/*"
@@ -349,8 +351,8 @@ class TreeSearchAgent:
     def _final_refit(self, best: Node) -> bool:
         """Re-run the chosen script with the validation rows folded back into train.csv.
         Returns True if it produced a valid submission at nodes/final/submission.csv."""
-        full = pd.read_csv(self.task.public_dir / "train.csv")
-        full.to_csv(self.sandbox.host_path("input/train.csv"), index=False)
+        shutil.copyfile(self.task.public_dir / self.task.train_file,
+                        self.sandbox.host_path(f"input/{self.input_names['train']}"))
         self.sandbox.write_file("nodes/final/solution.py", best.code)
         timeout = int(max(10, min(self.cfg.node_timeout_s, self._remaining())))
         r = self.sandbox.exec("cd nodes/final && python solution.py", timeout=timeout)
