@@ -24,7 +24,7 @@ say "vllm $(venv/bin/python -c 'import vllm;print(vllm.__version__)') ready"
 
 # 2. start the server unless it is already answering
 if ! curl -sf "http://127.0.0.1:${PORT}/v1/models" >/dev/null; then
-  ./serve.sh auto "$PORT"
+  ./serve.sh "${GPU:-auto}" "$PORT"   # GPU=<index> pins the server to one GPU
   for _ in $(seq 1 120); do
     curl -sf "http://127.0.0.1:${PORT}/v1/models" >/dev/null && break
     kill -0 "$(cat logs/srv.pid)" 2>/dev/null || { say "FAILED: server died"; tail -30 logs/srv.log; exit 1; }

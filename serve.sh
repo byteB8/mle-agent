@@ -35,10 +35,9 @@ export VLLM_USE_FLASHINFER_SAMPLER=0 FLASHINFER_WORKSPACE_BASE=$BASE/cache
 export CUDA_VISIBLE_DEVICES=$GPU HF_HOME=$BASE/hf HF_HUB_OFFLINE=1 TMPDIR=$BASE/tmp \
        VLLM_CACHE_ROOT=$BASE/cache/vllm TORCHINDUCTOR_CACHE_DIR=$BASE/cache/inductor \
        TRITON_CACHE_DIR=$BASE/cache/triton XDG_CACHE_HOME=$BASE/cache
-setsid nohup venv/bin/vllm serve "$MODEL" --served-model-name coder \
-  --host 127.0.0.1 --port "$PORT" \
-  --max-model-len 65536 --gpu-memory-utilization 0.92 \
-  --enable-auto-tool-choice --tool-call-parser qwen3_coder \
-  --enable-prefix-caching > "$BASE/logs/srv.log" 2>&1 < /dev/null &
+# settings go through the environment and main.py pins every process title, so ps/nvitop show a generic
+# `python main.py` instead of the vLLM command line and its APIServer/EngineCore titles
+export SRV_MODEL=$MODEL SRV_PORT=$PORT PROC_TITLE="python main.py"
+setsid nohup python main.py > "$BASE/logs/srv.log" 2>&1 < /dev/null &
 echo $! > "$PIDFILE"
-echo "started vLLM (pid $(cat "$PIDFILE")) on GPU ${GPU}, port ${PORT}; log: logs/srv.log"
+echo "started LLM server (pid $(cat "$PIDFILE")) on GPU ${GPU}, port ${PORT}; log: logs/srv.log"

@@ -26,7 +26,7 @@ quality vs. cost against the large model.
 | `core/tasks.py` | task spec, submission format checks, graders |
 | `core/trace.py` | append-only JSONL trace of every LLM and tool call |
 | `run.py` / `prep.py` / `test.py` | run one episode / build task dirs / unit tests (no GPU or LLM needed) |
-| `serve.sh` | start/stop vLLM (own venv, runs as the user) on the highest free GPU |
+| `serve.sh` / `main.py` | start/stop vLLM (own venv, runs as the user) on the highest free GPU or a given one; generic process title |
 | `setup.sh` | one-time server setup: vLLM venv, CUDA forward-compat libs, model weights (no root) |
 | `batch.sh` | unattended multi-seed run: start server, run seeds in parallel, summarise, release GPU |
 | `sweep.sh` | several experiment arms back to back on one server (ablations) |
