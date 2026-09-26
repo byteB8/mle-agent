@@ -41,6 +41,10 @@ def main() -> None:
     ap.add_argument("--debug-prob", type=float, default=0.5, help="tree: chance to debug a broken leaf")
     ap.add_argument("--node-timeout", type=int, default=600, help="tree: seconds per solution script")
     ap.add_argument("--lessons", action="store_true", help="tree: share error->fix lessons across branches")
+    ap.add_argument("--preflight-rows", type=int, default=0,
+                    help="tree: smoke-test each script on this many training rows first (0 = off)")
+    ap.add_argument("--search-max-rows", type=int, default=0,
+                    help="tree: cap training rows during search; refit the chosen script on full data (0 = off)")
     ap.add_argument("--self-valid", action="store_true",
                     help="tree: trust the script's printed VALIDATION_SCORE instead of a harness-held split")
     args = ap.parse_args()
@@ -64,7 +68,8 @@ def main() -> None:
             if args.agent == "tree":
                 cfg = SearchConfig(num_drafts=args.num_drafts, debug_prob=args.debug_prob,
                                    node_timeout_s=args.node_timeout, harness_valid=not args.self_valid,
-                                   lessons=args.lessons)
+                                   lessons=args.lessons, preflight_rows=args.preflight_rows,
+                                   search_max_rows=args.search_max_rows)
                 agent = TreeSearchAgent(llm, task, sandbox, tracer, budget, cfg, temperature=args.temperature,
                                         seed=args.seed, use_env_facts=args.env_facts)
             else:

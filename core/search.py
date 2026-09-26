@@ -19,6 +19,8 @@ import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import pandas as pd
+
 from .agent import Budget, EpisodeState, accepted_path, env_facts
 from .llm import LLM, LLMError
 from .sandbox import DockerSandbox, truncate
@@ -82,6 +84,7 @@ class Node:
     error: str = ""
     debug_depth: int = 0
     exec_s: float = 0.0
+    preflight_s: float = 0.0
     children: list[int] = field(default_factory=list)
 
     def summary(self) -> str:
@@ -119,6 +122,11 @@ class SearchConfig:
     lessons: bool = False           # share error->fix lessons across branches
     max_lessons: int = 8
     lesson_min_count: int = 2       # an unfixed error becomes a lesson once this many nodes hit it
+    preflight_rows: int = 0         # >0: first run each script on this many training rows to catch crashes cheaply
+    preflight_min_rows: int = 20_000  # ... only when the training set is at least this large
+    preflight_timeout_s: int = 90
+    search_max_rows: int = 0        # >0: cap training rows during search; the chosen script is refit on full data
+    max_reserve_frac: float = 0.25  # most of the budget the final refit may hold back
 
 
 class TreeSearchAgent:
@@ -134,6 +142,8 @@ class TreeSearchAgent:
         self.data_preview = ""
         self.valid_labels = None    # set in harness-valid mode; never written under /work
         self.lessons: dict[str, Lesson] = {}
+        self.preflight_ids = None   # (valid ids, test ids) of the pre-flight sample, when pre-flight is on
+        self.refit_ratio = 1.0      # full training rows / search training rows
 
     # ---------- scoring ----------
     def _better(self, a: float, b: float) -> bool:
@@ -214,9 +224,37 @@ class TreeSearchAgent:
     def _remaining(self) -> float:
         return self.budget.time_limit_s - self.state.elapsed()
 
+    def _preflight(self, node: Node) -> str | None:
+        """Run the script on the small sample in input_small/. Returns an error, or None if it passed or was
+        inconclusive (timeout: probably just slow, so the full run decides)."""
+        rel = f"nodes/{node.id}_pf"
+        self.sandbox.write_file(f"{rel}/solution.py", node.code.replace("/work/input/", "/work/input_small/"))
+        timeout = int(max(10, min(self.cfg.preflight_timeout_s, self._remaining() - self._final_reserve())))
+        r = self.sandbox.exec(f"cd {rel} && python solution.py", timeout=timeout)
+        node.preflight_s = r.duration
+        if r.timed_out:
+            return None
+        if r.exit_code != 0:
+            node.output = f"[harness] pre-flight run on a {self.cfg.preflight_rows}-row training sample failed:\n{r.output}"
+            return f"exit {r.exit_code}: " + (r.output.strip().splitlines() or [""])[-1][:200]
+        valid_ids, test_ids = self.preflight_ids
+        problems = ["submission.csv: " + p for p in self.task.validate_submission(
+            self.sandbox.host_path(f"{rel}/submission.csv"), expected_ids=test_ids)]
+        problems += ["valid_predictions.csv: " + p for p in self.task.validate_submission(
+            self.sandbox.host_path(f"{rel}/valid_predictions.csv"), expected_ids=valid_ids)]
+        if problems:
+            node.output = f"[harness] pre-flight run produced invalid output:\n{r.output}"
+            return "invalid output: " + "; ".join(problems)
+        return None
+
     def _run_node(self, node: Node) -> None:
         rel = f"nodes/{node.id}"
         self.sandbox.write_file(f"{rel}/solution.py", node.code)
+        if self.preflight_ids is not None:
+            err = self._preflight(node)
+            if err:
+                node.error = f"pre-flight: {err}"
+                return
         # a node may not eat into the time kept back for the final refit
         timeout = int(max(10, min(self.cfg.node_timeout_s, self._remaining() - self._final_reserve())))
         r = self.sandbox.exec(f"cd {rel} && python solution.py", timeout=timeout)  # cwd is /work
@@ -285,16 +323,20 @@ class TreeSearchAgent:
         self.tracer.log("node", step=self.state.step, id=node.id, parent=node.parent, op=op, plan=node.plan,
                         code=node.code, output=truncate(node.output, 4000), score=node.score,
                         self_score=node.self_score, buggy=node.buggy,
-                        error=node.error, exec_s=round(node.exec_s, 1), prompt=prompt, response=text,
+                        error=node.error, exec_s=round(node.exec_s, 1), preflight_s=round(node.preflight_s, 1),
+                        prompt=prompt, response=text,
                         prompt_tokens=c.prompt_tokens, completion_tokens=c.completion_tokens,
                         llm_latency=round(c.latency, 2), best_id=best.id if best else None,
                         best_score=best.score if best else None)
         return True
 
     def _final_reserve(self) -> float:
-        """Time kept back to re-run the best script on the full training set."""
+        """Time kept back to re-run the best script on the full training set: its search runtime scaled by
+        how much more data the refit sees, capped at a fraction of the budget."""
         best = self.best()
-        return 1.5 * best.exec_s + 30 if (best and self.valid_labels is not None) else 0.0
+        if not best or self.valid_labels is None:
+            return 0.0
+        return min(self.cfg.max_reserve_frac * self.budget.time_limit_s, 1.5 * best.exec_s * self.refit_ratio + 30)
 
     def _out_of_budget(self) -> str | None:
         if self.state.step >= self.budget.max_steps:
@@ -306,7 +348,16 @@ class TreeSearchAgent:
         return None
 
     def _setup_harness_valid(self) -> None:
-        train, valid_x, valid_y = self.task.split_train(seed=self.seed or 0, valid_frac=self.cfg.valid_frac)
+        seed = self.seed or 0
+        train, valid_x, valid_y = self.task.split_train(seed=seed, valid_frac=self.cfg.valid_frac)
+        full_rows = len(train) + len(valid_x)          # what the final refit trains on
+        cap = self.cfg.search_max_rows
+        if cap and len(train) > cap:                   # multi-fidelity: search on a subsample
+            train = train.sample(n=cap, random_state=seed)
+        if cap and len(valid_x) > cap // 2:
+            keep = valid_x.sample(n=cap // 2, random_state=seed).index
+            valid_x, valid_y = valid_x.loc[keep], valid_y.loc[keep]
+        self.refit_ratio = full_rows / len(train)
         inp = self.sandbox.host_path("input")
         inp.mkdir(parents=True, exist_ok=True)
         write_table(train, inp / self.input_names["train"])
@@ -314,6 +365,29 @@ class TreeSearchAgent:
         shutil.copyfile(self.task.public_dir / self.task.test_file, inp / self.input_names["test"])
         valid_y.to_csv(self.sandbox.workdir.parent / "valid_labels.csv", index=False)  # audit copy, outside /work
         self.valid_labels = valid_y
+        if self.cfg.preflight_rows and len(train) >= self.cfg.preflight_min_rows:
+            self._setup_preflight(train, valid_x)
+
+    def _setup_preflight(self, train, valid_x) -> None:
+        """input_small/: a few training rows (at least one per class when the target is categorical) and the
+        first rows of valid/test, so a script can be smoke-tested in seconds."""
+        from .tasks import read_table
+        seed, n = self.seed or 0, self.cfg.preflight_rows
+        label = self.task.label_col or (self.task.target_cols[0] if len(self.task.target_cols) == 1 else None)
+        parts = []
+        if label is not None and train[label].nunique() <= 100:
+            parts.append(train.groupby(label, group_keys=False).head(1))
+        rest = train.drop(parts[0].index) if parts else train
+        parts.append(rest.sample(n=max(0, min(len(rest), n - sum(len(p) for p in parts))), random_state=seed))
+        small_train = pd.concat(parts)
+        small_valid = valid_x.head(200)
+        small_test = read_table(self.task.public_dir / self.task.test_file).head(200)
+        inp = self.sandbox.host_path("input_small")
+        inp.mkdir(parents=True, exist_ok=True)
+        write_table(small_train, inp / self.input_names["train"])
+        write_table(small_valid, inp / self.input_names["valid"])
+        write_table(small_test, inp / self.input_names["test"])
+        self.preflight_ids = (small_valid[self.task.id_col], small_test[self.task.id_col])
 
     def run(self) -> dict:
         sb = self.sandbox
@@ -328,6 +402,10 @@ class TreeSearchAgent:
                                     node_timeout=self.cfg.node_timeout_s, metric=self.task.metric,
                                     direction="higher is better" if self.task.higher_is_better else "lower is better",
                                     **self.input_names)
+        if harness and self.refit_ratio > 1.01:
+            self.system += (f"\n\nNote: during the search, {self.input_names['train']} is a {1 / self.refit_ratio:.0%} "
+                            "subsample of the training data. The script you end up with is re-run once on the full data "
+                            f"(~{self.refit_ratio:.0f}x more rows), so don't hard-code row counts and keep the runtime scalable.")
         if self.use_env_facts:
             self.system += env_facts(sb)
         where = "/work/input/* /data/sample_submission.csv" if harness else "/data/*"
@@ -354,7 +432,7 @@ class TreeSearchAgent:
         shutil.copyfile(self.task.public_dir / self.task.train_file,
                         self.sandbox.host_path(f"input/{self.input_names['train']}"))
         self.sandbox.write_file("nodes/final/solution.py", best.code)
-        timeout = int(max(10, min(self.cfg.node_timeout_s, self._remaining())))
+        timeout = int(max(10, self._remaining()))  # full data can take longer than a search node
         r = self.sandbox.exec("cd nodes/final && python solution.py", timeout=timeout)
         ok = r.exit_code == 0 and not self.task.validate_submission(self.sandbox.host_path("nodes/final/submission.csv"))
         self.tracer.log("final_refit", best_id=best.id, ok=ok, exit=r.exit_code, exec_s=round(r.duration, 1),
@@ -380,6 +458,8 @@ class TreeSearchAgent:
                 "higher_is_better": self.task.higher_is_better, "valid_submission": final.exists(),
                 "submission_source": source, "early_submits": 0,
                 "val_mode": "harness" if self.valid_labels is not None else "self_reported",
+                "refit_ratio": round(self.refit_ratio, 2), "preflight": self.preflight_ids is not None,
+                "preflight_rejects": sum(n.error.startswith("pre-flight") for n in self.nodes),
                 "steps": self.state.step, "elapsed_s": round(self.state.elapsed(), 1),
                 "total_prompt_tokens": self.state.total_prompt_tokens,
                 "completion_tokens": self.state.completion_tokens,

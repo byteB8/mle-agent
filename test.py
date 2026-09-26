@@ -192,15 +192,15 @@ class TestTreeSearch(unittest.TestCase):
         self.assertEqual(res["best_node"], 0)
 
 
-def make_split_task(root: Path) -> Task:
+def make_split_task(root: Path, n: int = 60) -> Task:
     """Tabular task whose train.csv carries the label, so the harness can hold out validation rows.
     Label is exactly x > 0, so an honest script is perfect and a 'leaky' one can only lie."""
     import numpy as np
     rng = np.random.default_rng(0)
     (root / "public").mkdir(parents=True)
     (root / "private").mkdir()
-    x = rng.normal(size=60)
-    train = pd.DataFrame({"id": range(60), "x": x, "y": (x > 0).astype(int)})
+    x = rng.normal(size=n)
+    train = pd.DataFrame({"id": range(n), "x": x, "y": (x > 0).astype(int)})
     xt = rng.normal(size=20)
     train.to_csv(root / "public/train.csv", index=False)
     pd.DataFrame({"id": range(100, 120), "x": xt}).to_csv(root / "public/test.csv", index=False)
@@ -294,6 +294,61 @@ class TestTaskFormats(unittest.TestCase):
         t = pd.DataFrame({"a": [1.0, 2.0], "b": [3.0, 4.0]})
         self.assertAlmostEqual(_metric("rmsle_mean", t, t, ["a", "b"]), 0.0)
         self.assertGreater(_metric("rmsle_mean", t, t * 2, ["a", "b"]), 0.1)
+
+
+# Reads every input through the literal '/work/input/' prefix (as real scripts do), mapped to the LocalSandbox layout.
+SCRIPT2 = """import pandas as pd
+P = lambda f: ('/work/input/' + f).replace('/work/', '../../')
+tr = pd.read_csv(P('train.csv'))
+{crash}
+for src, dst in [('valid', 'valid_predictions.csv'), ('test', 'submission.csv')]:
+    df = pd.read_csv(P(src + '.csv'))
+    pd.DataFrame({{'id': df['id'], 'y': df['x']}}).to_csv(dst, index=False)
+print('train rows', len(tr))
+"""
+
+
+class TestPreflightAndFidelity(unittest.TestCase):
+    def run_one(self, code, n=3000, **cfg):
+        d = Path(tempfile.mkdtemp())
+        task = make_split_task(d / "t", n=n)
+        tracer = Tracer(d / "trace.jsonl")
+        with LocalSandbox("x", "img", d / "work", task.public_dir) as sb:
+            agent = TreeSearchAgent(ScriptedLLM([reply("go", code)]), task, sb, tracer,
+                                    Budget(max_steps=1, time_limit_s=300), SearchConfig(num_drafts=1, **cfg), seed=0)
+            res = agent.run()
+        tracer.close()
+        return d, agent, res, read_trace(d / "trace.jsonl")
+
+    def test_preflight_rejects_crash_without_full_run(self):
+        code = SCRIPT2.format(crash="raise ValueError('bad column')")
+        d, agent, res, _ = self.run_one(code, preflight_rows=50, preflight_min_rows=100)
+        node = agent.nodes[0]
+        self.assertTrue(node.error.startswith("pre-flight: exit 1: ValueError: bad column"))
+        self.assertIn("pre-flight run on a 50-row training sample failed", node.output)
+        self.assertFalse((d / "work/nodes/0/submission.csv").exists())   # full run never happened
+        self.assertEqual(res["preflight_rejects"], 1)
+
+    def test_preflight_pass_then_full_run(self):
+        d, agent, res, _ = self.run_one(SCRIPT2.format(crash=""), preflight_rows=50, preflight_min_rows=100)
+        self.assertFalse(agent.nodes[0].buggy)
+        self.assertEqual(len(pd.read_csv(d / "work/input_small/train.csv")), 50)
+        self.assertEqual(len(pd.read_csv(d / "work/nodes/0_pf/valid_predictions.csv")), 200)
+        self.assertIn("train rows 2400", agent.nodes[0].output)             # full run used the real input
+
+    def test_preflight_off_for_small_training_sets(self):
+        _, agent, res, _ = self.run_one(SCRIPT2.format(crash=""), n=60, preflight_rows=50, preflight_min_rows=100)
+        self.assertFalse(res["preflight"])
+
+    def test_search_on_subsample_refit_on_full(self):
+        d, agent, res, trace = self.run_one(SCRIPT2.format(crash=""), search_max_rows=1000)
+        self.assertEqual(len(pd.read_csv(d / "work/nodes/0/valid_predictions.csv")), 500)   # valid capped at cap/2
+        self.assertIn("train rows 1000", agent.nodes[0].output)
+        self.assertEqual(res["refit_ratio"], 3.0)                           # 3000 full rows / 1000 search rows
+        refit = [e for e in trace if e["kind"] == "final_refit"][0]
+        self.assertIn("train rows 3000", refit["output"])
+        self.assertEqual((res["submission_source"], res["score"]), ("tree_best_refit", 1.0))
+        self.assertIn("subsample of the training data", agent.system)
 
 
 class TestHarnessValidation(unittest.TestCase):
