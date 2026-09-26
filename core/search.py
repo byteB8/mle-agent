@@ -106,7 +106,7 @@ class Node:
     debug_depth: int = 0
     exec_s: float = 0.0
     preflight_s: float = 0.0
-    family: str = ""                # model family assigned to a diverse draft
+    family: str = ""                # model family of the draft this node descends from (diverse drafts)
     children: list[int] = field(default_factory=list)
 
     def summary(self) -> str:
@@ -151,6 +151,9 @@ class SearchConfig:
     max_reserve_frac: float = 0.25  # most of the budget the final refit may hold back
     refit_max_ratio: float = 4.0    # final refit trains on at most this multiple of the search rows (time permitting)
     diverse_drafts: bool = False    # assign each draft a different model family
+    family_rescue: bool = False     # with diverse drafts: make every family produce a valid node before exploiting,
+    family_attempts: int = 3        # ... spending at most this many debug/redraft nodes per family
+    runner_up_prob: float = 0.3     # ... and sometimes improve the best node of the runner-up family instead
 
 
 class TreeSearchAgent:
@@ -187,17 +190,51 @@ class TreeSearchAgent:
         return best
 
     # ---------- policy ----------
-    def select(self) -> tuple[str, Node | None]:
+    def _best_of(self, nodes: list[Node]) -> Node | None:
+        best = None
+        for n in nodes:
+            if not n.buggy and (best is None or self._better(n.score, best.score)):
+                best = n
+        return best
+
+    def _rescue(self) -> tuple[str, Node | None, str] | None:
+        """First drafted family that has no valid node yet and attempts left: debug its newest broken leaf,
+        or re-draft it when there is nothing to debug (e.g. the reply had no code)."""
+        seen = []
+        for d in (n for n in self.nodes if n.parent is None and n.family):
+            if d.family in seen:
+                continue
+            seen.append(d.family)
+            fam_nodes = [n for n in self.nodes if n.family == d.family]
+            if any(not n.buggy for n in fam_nodes) or len(fam_nodes) - 1 >= self.cfg.family_attempts:
+                continue
+            leaves = [n for n in fam_nodes if n.buggy and not n.children and n.code
+                      and n.debug_depth < self.cfg.max_debug_depth]
+            return ("debug", leaves[-1], d.family) if leaves else ("draft", None, d.family)
+        return None
+
+    def select(self) -> tuple[str, Node | None, str]:
+        """Returns (operation, parent node, model family for a draft)."""
         drafts = [n for n in self.nodes if n.parent is None]
         if len(drafts) < self.cfg.num_drafts:
-            return "draft", None
+            return "draft", None, self._next_family()
+        if self.cfg.diverse_drafts and self.cfg.family_rescue:
+            rescue = self._rescue()
+            if rescue:
+                return rescue
         if self.rng.random() < self.cfg.debug_prob:
             debuggable = [n for n in self.nodes if n.buggy and not n.children
                           and n.debug_depth < self.cfg.max_debug_depth and n.code]
             if debuggable:
-                return "debug", self.rng.choice(debuggable)
+                return "debug", self.rng.choice(debuggable), ""
         best = self.best()
-        return ("improve", best) if best else ("draft", None)
+        if best and self.cfg.family_rescue and self.rng.random() < self.cfg.runner_up_prob:
+            others = [self._best_of([n for n in self.nodes if n.family == f])
+                      for f in {n.family for n in self.nodes if n.family and n.family != best.family}]
+            runner_up = self._best_of([n for n in others if n is not None])
+            if runner_up:
+                return "improve", runner_up, ""
+        return ("improve", best, "") if best else ("draft", None, self._next_family())
 
     # ---------- prompts ----------
     def _memory(self) -> str:
@@ -235,6 +272,7 @@ class TreeSearchAgent:
         return self.families[drafts % len(self.families)]
 
     def _prompt(self, op: str, parent: Node | None, family: str = "") -> str:
+        family = family if op == "draft" else ""
         head = (f"# Task\n{self.task.description}\n\n# Data preview\n{self.data_preview}\n"
                 + self._pitfalls())
         if op == "draft":
@@ -325,9 +363,9 @@ class TreeSearchAgent:
             node.output += f"\n[harness] {node.error}"
 
     def _step(self) -> bool:
-        op, parent = self.select()
-        family = self._next_family() if op == "draft" else ""
+        op, parent, family = self.select()
         prompt = self._prompt(op, parent, family)
+        family = family or (parent.family if parent else "")   # descendants keep their draft's family
         try:
             c = self.llm.chat([{"role": "system", "content": self.system}, {"role": "user", "content": prompt}],
                               temperature=self.temperature, max_tokens=8192,
@@ -512,6 +550,8 @@ class TreeSearchAgent:
                 "val_mode": "harness" if self.valid_labels is not None else "self_reported",
                 "full_ratio": round(self.full_ratio, 2), "preflight": self.preflight_ids is not None,
                 "draft_families": [n.family for n in self.nodes if n.op == "draft" and n.family],
+                "valid_families": sorted({n.family for n in self.nodes if n.family and not n.buggy}),
+                "best_family": best.family if best else None,
                 "preflight_rejects": sum(n.error.startswith("pre-flight") for n in self.nodes),
                 "steps": self.state.step, "elapsed_s": round(self.state.elapsed(), 1),
                 "total_prompt_tokens": self.state.total_prompt_tokens,

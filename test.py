@@ -395,6 +395,40 @@ class TestRefitAndDiversity(unittest.TestCase):
         for i, fam in enumerate(fams):
             self.assertIn(f"Model family for this draft: {fam}", llm.seen[i][1]["content"])
 
+    def run_rescue(self, turns, **cfg):
+        d = Path(tempfile.mkdtemp())
+        task = make_task(d / "t")
+        llm = ScriptedLLM(turns)
+        with LocalSandbox("x", "img", d / "work", task.public_dir) as sb:
+            agent = TreeSearchAgent(llm, task, sb, Tracer(None), Budget(max_steps=len(turns), time_limit_s=300),
+                                    SearchConfig(num_drafts=3, diverse_drafts=True, family_rescue=True,
+                                                 debug_prob=0.0, runner_up_prob=0.0, **cfg), seed=0)
+            res = agent.run()
+        return agent, llm, res
+
+    def test_family_rescue_fixes_each_family_before_exploiting(self):
+        ok = lambda v: GOOD.format(preds=[.1, .9, .2, .8], val=v)
+        turns = [reply("d0", "raise SystemExit(1)"),       # family A crashes
+                 reply("d1", ok(0.6)),                     # family B works
+                 reply("d2 but no code"),                  # family C: nothing to debug
+                 reply("fix A", ok(0.7)),                  # rescue: debug A's broken leaf
+                 reply("redraft C", ok(0.65)),             # rescue: fresh draft of C
+                 reply("improve", ok(0.8))]                # all families valid -> exploit the best
+        agent, llm, res = self.run_rescue(turns)
+        fam = [n.family for n in agent.nodes]
+        self.assertEqual([n.op for n in agent.nodes], ["draft", "draft", "draft", "debug", "draft", "improve"])
+        self.assertEqual((fam[3], fam[4]), (fam[0], fam[2]))              # rescued A, then re-drafted C
+        self.assertIn(f"Model family for this draft: {fam[2]}", llm.seen[4][1]["content"])
+        self.assertEqual((agent.nodes[5].parent, fam[5]), (3, fam[0]))    # improve the best (A's fix, 0.7)
+        self.assertEqual(len(res["valid_families"]), 3)
+
+    def test_family_rescue_gives_up_after_attempts(self):
+        ok = GOOD.format(preds=[.1, .9, .2, .8], val=0.6)
+        turns = [reply("d0", "raise SystemExit(1)"), reply("d1", ok), reply("d2", ok)] + \
+                [reply(f"fix {i}", "raise SystemExit(1)") for i in range(2)] + [reply("improve", ok)]
+        agent, _, _ = self.run_rescue(turns, family_attempts=2)
+        self.assertEqual([n.op for n in agent.nodes], ["draft", "draft", "draft", "debug", "debug", "improve"])
+
     def test_unterminated_code_block_is_recovered(self):
         from core.search import extract_code
         self.assertEqual(extract_code("plan\n```python\nprint(1)\n```\nmore\n```python\nprint(2)\n```"), "print(2)")
