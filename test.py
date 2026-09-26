@@ -344,11 +344,62 @@ class TestPreflightAndFidelity(unittest.TestCase):
         d, agent, res, trace = self.run_one(SCRIPT2.format(crash=""), search_max_rows=1000)
         self.assertEqual(len(pd.read_csv(d / "work/nodes/0/valid_predictions.csv")), 500)   # valid capped at cap/2
         self.assertIn("train rows 1000", agent.nodes[0].output)
-        self.assertEqual(res["refit_ratio"], 3.0)                           # 3000 full rows / 1000 search rows
+        self.assertEqual(res["full_ratio"], 3.0)                            # 3000 full rows / 1000 search rows
         refit = [e for e in trace if e["kind"] == "final_refit"][0]
         self.assertIn("train rows 3000", refit["output"])
         self.assertEqual((res["submission_source"], res["score"]), ("tree_best_refit", 1.0))
         self.assertIn("subsample of the training data", agent.system)
+
+
+class TestRefitAndDiversity(unittest.TestCase):
+    def test_refit_bounded_by_ratio(self):
+        t = TestPreflightAndFidelity()
+        d, agent, res, trace = t.run_one(SCRIPT2.format(crash=""), search_max_rows=500, refit_max_ratio=2.0)
+        refit = [e for e in trace if e["kind"] == "final_refit"][0]
+        self.assertEqual((refit["rows"], refit["ratio"]), (1000, 2.0))      # 2x the 500 search rows, not all 3000
+        self.assertIn("train rows 1000", refit["output"])
+        self.assertEqual(res["submission_source"], "tree_best_refit")
+
+    def test_refit_skipped_without_time(self):
+        class NoTimeAtEnd(TreeSearchAgent):
+            at_end = False
+            def _remaining(self):
+                return 21.0 if self.at_end else 300.0   # (21 - 20) / 1.5 < 1.1x: no time
+            def _finish(self, stop_reason):
+                self.at_end = True
+                return super()._finish(stop_reason)
+        d = Path(tempfile.mkdtemp())
+        task = make_split_task(d / "t", n=3000)
+        tracer = Tracer(d / "trace.jsonl")
+        with LocalSandbox("x", "img", d / "work", task.public_dir) as sb:
+            agent = NoTimeAtEnd(ScriptedLLM([reply("go", SCRIPT2.format(crash=""))]), task, sb, tracer,
+                                Budget(max_steps=1, time_limit_s=300), SearchConfig(num_drafts=1, search_max_rows=500),
+                                seed=0)
+            res = agent.run()
+        tracer.close()
+        refit = [e for e in read_trace(d / "trace.jsonl") if e["kind"] == "final_refit"][0]
+        self.assertTrue(refit["skipped"])
+        self.assertEqual((res["submission_source"], res["score"]), ("tree_best", 1.0))  # search model still submitted
+
+    def test_diverse_drafts_get_distinct_families(self):
+        turns = [reply(f"d{i}", GOOD.format(preds=[.1, .9, .2, .8], val=0.5 + i / 10)) for i in range(3)]
+        d = Path(tempfile.mkdtemp())
+        task = make_task(d / "t")
+        llm = ScriptedLLM(turns)
+        with LocalSandbox("x", "img", d / "work", task.public_dir) as sb:
+            agent = TreeSearchAgent(llm, task, sb, Tracer(None), Budget(max_steps=3, time_limit_s=300),
+                                    SearchConfig(num_drafts=3, diverse_drafts=True), seed=0)
+            res = agent.run()
+        fams = res["draft_families"]
+        self.assertEqual(len(set(fams)), 3)
+        for i, fam in enumerate(fams):
+            self.assertIn(f"Model family for this draft: {fam}", llm.seen[i][1]["content"])
+
+    def test_unterminated_code_block_is_recovered(self):
+        from core.search import extract_code
+        self.assertEqual(extract_code("plan\n```python\nprint(1)\n```\nmore\n```python\nprint(2)\n```"), "print(2)")
+        self.assertEqual(extract_code("plan\n```python\nimport x\nprint(3)"), "import x\nprint(3)")
+        self.assertEqual(extract_code("no code here"), "")
 
 
 class TestHarnessValidation(unittest.TestCase):

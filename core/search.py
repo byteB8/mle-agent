@@ -24,11 +24,32 @@ import pandas as pd
 from .agent import Budget, EpisodeState, accepted_path, env_facts
 from .llm import LLM, LLMError
 from .sandbox import DockerSandbox, truncate
-from .tasks import Task, write_table
+from .tasks import Task, read_table, write_table
 from .trace import Tracer
 
 SCORE_RE = re.compile(r"VALIDATION_SCORE:\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)")
 CODE_RE = re.compile(r"```(?:python|py)?\s*\n(.*?)```", re.S)
+OPEN_CODE_RE = re.compile(r"```(?:python|py)?\s*\n(.*)\Z", re.S)   # last block with no closing fence
+
+
+def extract_code(text: str) -> str:
+    """Last fenced python block; falls back to an unterminated one (reply cut off at the token limit)."""
+    blocks = CODE_RE.findall(text)
+    if blocks:
+        return blocks[-1].strip()
+    m = OPEN_CODE_RE.search(text)
+    return m.group(1).strip() if m else ""
+
+
+# One per initial draft (order shuffled per seed), so the search starts from genuinely different model families.
+MODEL_FAMILIES = [
+    "gradient-boosted decision trees (LightGBM, XGBoost or CatBoost)",
+    "a linear model (logistic / ridge / linear regression) with thorough feature preprocessing: scaling, one-hot "
+    "encoding, TF-IDF for text, interaction or polynomial features",
+    "a neural network (scikit-learn MLPClassifier / MLPRegressor) on standardised features",
+    "a random-forest or extra-trees ensemble",
+    "a k-nearest-neighbours or support-vector-machine model on scaled features",
+]
 
 SYSTEM = """You are an expert machine-learning engineer solving a Kaggle-style task by writing complete Python scripts.
 
@@ -85,6 +106,7 @@ class Node:
     debug_depth: int = 0
     exec_s: float = 0.0
     preflight_s: float = 0.0
+    family: str = ""                # model family assigned to a diverse draft
     children: list[int] = field(default_factory=list)
 
     def summary(self) -> str:
@@ -127,6 +149,8 @@ class SearchConfig:
     preflight_timeout_s: int = 90
     search_max_rows: int = 0        # >0: cap training rows during search; the chosen script is refit on full data
     max_reserve_frac: float = 0.25  # most of the budget the final refit may hold back
+    refit_max_ratio: float = 4.0    # final refit trains on at most this multiple of the search rows (time permitting)
+    diverse_drafts: bool = False    # assign each draft a different model family
 
 
 class TreeSearchAgent:
@@ -137,13 +161,16 @@ class TreeSearchAgent:
         self.cfg = config or SearchConfig()
         self.temperature, self.seed, self.use_env_facts = temperature, seed, use_env_facts
         self.rng = random.Random(seed)
+        self.families = MODEL_FAMILIES[:]
+        self.rng.shuffle(self.families)
         self.state = EpisodeState()
         self.nodes: list[Node] = []
         self.data_preview = ""
         self.valid_labels = None    # set in harness-valid mode; never written under /work
         self.lessons: dict[str, Lesson] = {}
         self.preflight_ids = None   # (valid ids, test ids) of the pre-flight sample, when pre-flight is on
-        self.refit_ratio = 1.0      # full training rows / search training rows
+        self.full_ratio = 1.0       # all training rows / search training rows
+        self.search_rows = 0
 
     # ---------- scoring ----------
     def _better(self, a: float, b: float) -> bool:
@@ -201,13 +228,21 @@ class TreeSearchAgent:
         return ("\n# Known pitfalls in this environment (learned from earlier scripts; avoid them)\n"
                 + "\n".join(l.render() for l in shown) + "\n")
 
-    def _prompt(self, op: str, parent: Node | None) -> str:
+    def _next_family(self) -> str:
+        if not self.cfg.diverse_drafts:
+            return ""
+        drafts = sum(n.op == "draft" for n in self.nodes)
+        return self.families[drafts % len(self.families)]
+
+    def _prompt(self, op: str, parent: Node | None, family: str = "") -> str:
         head = (f"# Task\n{self.task.description}\n\n# Data preview\n{self.data_preview}\n"
                 + self._pitfalls())
         if op == "draft":
             return (head + f"\n# Earlier attempts\n{self._memory()}\n\n"
                     "Write a NEW solution. Prefer an approach that differs from the earlier attempts; "
-                    "a simple, correct, fast solution is better than an ambitious broken one.")
+                    "a simple, correct, fast solution is better than an ambitious broken one."
+                    + (f"\n\nModel family for this draft: {family}. Other drafts explore other families, so stay "
+                       "within this one and make it as strong as you can." if family else ""))
         if op == "improve":
             return (head + f"\n# Earlier attempts\n{self._memory()}\n\n"
                     f"# Current best solution (node {parent.id}, validation {parent.score:.5f})\n"
@@ -291,7 +326,8 @@ class TreeSearchAgent:
 
     def _step(self) -> bool:
         op, parent = self.select()
-        prompt = self._prompt(op, parent)
+        family = self._next_family() if op == "draft" else ""
+        prompt = self._prompt(op, parent, family)
         try:
             c = self.llm.chat([{"role": "system", "content": self.system}, {"role": "user", "content": prompt}],
                               temperature=self.temperature, max_tokens=8192,
@@ -305,10 +341,8 @@ class TreeSearchAgent:
         self.state.completion_tokens += c.completion_tokens
 
         text = c.message.get("content") or ""
-        blocks = CODE_RE.findall(text)
         node = Node(id=len(self.nodes), parent=None if parent is None else parent.id, op=op,
-                    plan=text.split("```")[0].strip()[:600],
-                    code=blocks[-1].strip() if blocks else "",
+                    plan=text.split("```")[0].strip()[:600], code=extract_code(text), family=family,
                     debug_depth=(parent.debug_depth + 1) if op == "debug" else 0)
         if parent is not None:
             parent.children.append(node.id)
@@ -320,7 +354,8 @@ class TreeSearchAgent:
         self.nodes.append(node)
         self._learn(node)
         best = self.best()
-        self.tracer.log("node", step=self.state.step, id=node.id, parent=node.parent, op=op, plan=node.plan,
+        self.tracer.log("node", step=self.state.step, id=node.id, parent=node.parent, op=op, family=family,
+                        plan=node.plan,
                         code=node.code, output=truncate(node.output, 4000), score=node.score,
                         self_score=node.self_score, buggy=node.buggy,
                         error=node.error, exec_s=round(node.exec_s, 1), preflight_s=round(node.preflight_s, 1),
@@ -336,7 +371,11 @@ class TreeSearchAgent:
         best = self.best()
         if not best or self.valid_labels is None:
             return 0.0
-        return min(self.cfg.max_reserve_frac * self.budget.time_limit_s, 1.5 * best.exec_s * self.refit_ratio + 30)
+        return min(self.cfg.max_reserve_frac * self.budget.time_limit_s,
+                   1.5 * best.exec_s * self._planned_ratio() + 30)
+
+    def _planned_ratio(self) -> float:
+        return min(self.full_ratio, self.cfg.refit_max_ratio)
 
     def _out_of_budget(self) -> str | None:
         if self.state.step >= self.budget.max_steps:
@@ -357,7 +396,8 @@ class TreeSearchAgent:
         if cap and len(valid_x) > cap // 2:
             keep = valid_x.sample(n=cap // 2, random_state=seed).index
             valid_x, valid_y = valid_x.loc[keep], valid_y.loc[keep]
-        self.refit_ratio = full_rows / len(train)
+        self.full_ratio = full_rows / len(train)
+        self.search_rows = len(train)
         inp = self.sandbox.host_path("input")
         inp.mkdir(parents=True, exist_ok=True)
         write_table(train, inp / self.input_names["train"])
@@ -371,7 +411,6 @@ class TreeSearchAgent:
     def _setup_preflight(self, train, valid_x) -> None:
         """input_small/: a few training rows (at least one per class when the target is categorical) and the
         first rows of valid/test, so a script can be smoke-tested in seconds."""
-        from .tasks import read_table
         seed, n = self.seed or 0, self.cfg.preflight_rows
         label = self.task.label_col or (self.task.target_cols[0] if len(self.task.target_cols) == 1 else None)
         parts = []
@@ -402,10 +441,11 @@ class TreeSearchAgent:
                                     node_timeout=self.cfg.node_timeout_s, metric=self.task.metric,
                                     direction="higher is better" if self.task.higher_is_better else "lower is better",
                                     **self.input_names)
-        if harness and self.refit_ratio > 1.01:
-            self.system += (f"\n\nNote: during the search, {self.input_names['train']} is a {1 / self.refit_ratio:.0%} "
-                            "subsample of the training data. The script you end up with is re-run once on the full data "
-                            f"(~{self.refit_ratio:.0f}x more rows), so don't hard-code row counts and keep the runtime scalable.")
+        if harness and self.full_ratio > 1.5:
+            self.system += (f"\n\nNote: during the search, {self.input_names['train']} is a {1 / self.full_ratio:.0%} "
+                            "subsample of the training data. The script you end up with is re-run once on more data "
+                            f"(up to ~{self._planned_ratio():.0f}x more rows), so don't hard-code row counts and keep the "
+                            "runtime scalable.")
         if self.use_env_facts:
             self.system += env_facts(sb)
         where = "/work/input/* /data/sample_submission.csv" if harness else "/data/*"
@@ -427,16 +467,28 @@ class TreeSearchAgent:
         return result
 
     def _final_refit(self, best: Node) -> bool:
-        """Re-run the chosen script with the validation rows folded back into train.csv.
-        Returns True if it produced a valid submission at nodes/final/submission.csv."""
-        shutil.copyfile(self.task.public_dir / self.task.train_file,
-                        self.sandbox.host_path(f"input/{self.input_names['train']}"))
+        """Re-run the chosen script on more training data (validation rows folded back in, and for a subsampled
+        search up to `refit_max_ratio` x the search rows), sized to the time actually left: runtime is assumed to
+        grow linearly with rows, with a 1.5x safety factor. Returns True if it produced a valid submission at
+        nodes/final/submission.csv; skips (False) when there isn't time for a meaningfully larger fit."""
+        affordable = (self._remaining() - 20) / (1.5 * max(best.exec_s, 1.0))
+        ratio = min(self._planned_ratio(), affordable)
+        if ratio < 1.1:
+            self.tracer.log("final_refit", best_id=best.id, ok=False, skipped=True, affordable_ratio=round(affordable, 2))
+            return False
+        full = read_table(self.task.public_dir / self.task.train_file)
+        rows = int(min(len(full), self.search_rows * ratio))
+        dst = self.sandbox.host_path(f"input/{self.input_names['train']}")
+        if rows >= len(full):
+            shutil.copyfile(self.task.public_dir / self.task.train_file, dst)
+        else:
+            write_table(full.sample(n=rows, random_state=self.seed or 0), dst)
         self.sandbox.write_file("nodes/final/solution.py", best.code)
-        timeout = int(max(10, self._remaining()))  # full data can take longer than a search node
+        timeout = int(max(10, self._remaining()))  # more data can take longer than a search node
         r = self.sandbox.exec("cd nodes/final && python solution.py", timeout=timeout)
         ok = r.exit_code == 0 and not self.task.validate_submission(self.sandbox.host_path("nodes/final/submission.csv"))
         self.tracer.log("final_refit", best_id=best.id, ok=ok, exit=r.exit_code, exec_s=round(r.duration, 1),
-                        output=truncate(r.output, 2000))
+                        rows=rows, ratio=round(rows / max(self.search_rows, 1), 2), output=truncate(r.output, 2000))
         return ok
 
     def _finish(self, stop_reason: str) -> dict:
@@ -458,7 +510,8 @@ class TreeSearchAgent:
                 "higher_is_better": self.task.higher_is_better, "valid_submission": final.exists(),
                 "submission_source": source, "early_submits": 0,
                 "val_mode": "harness" if self.valid_labels is not None else "self_reported",
-                "refit_ratio": round(self.refit_ratio, 2), "preflight": self.preflight_ids is not None,
+                "full_ratio": round(self.full_ratio, 2), "preflight": self.preflight_ids is not None,
+                "draft_families": [n.family for n in self.nodes if n.op == "draft" and n.family],
                 "preflight_rejects": sum(n.error.startswith("pre-flight") for n in self.nodes),
                 "steps": self.state.step, "elapsed_s": round(self.state.elapsed(), 1),
                 "total_prompt_tokens": self.state.total_prompt_tokens,

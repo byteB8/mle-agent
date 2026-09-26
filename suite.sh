@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Arms over a *suite* of tasks: within an arm every (task, seed) runs in parallel; arms run one after another
 # on one LLM server, which is released at the end.
-#   GPU=2 PORT=8012 ./suite.sh "<task dirs>" "<seeds>" tag:"run.py args" [tag:"run.py args" ...]
+#   GPU=2 PORT=8012 [KEEP_SERVER=1] ./suite.sh "<task dirs>" "<seeds>" tag:"run.py args" [tag:"run.py args" ...]
 #   e.g. GPU=2 PORT=8012 ./suite.sh "data/leaf-classification data/random-acts-of-pizza" "0" \
 #          pilot_tree:"--agent tree --time-limit-min 30 --cpus 4" pilot_react:"--time-limit-min 30 --cpus 4"
 set -uo pipefail
@@ -37,5 +37,5 @@ for f in sorted(glob.glob(f"runs/{sys.argv[1]}-*/result.json")):
     print(f"  {r['run_id']}: {r['metric']}={r['score']} stop={r['stop_reason']} t={r['elapsed_s']}s{extra}")
 PYEOF
 done
-./serve.sh stop "$PORT"
+[ "${KEEP_SERVER:-0}" = 1 ] || ./serve.sh stop "$PORT"   # KEEP_SERVER=1: caller runs more rounds on it
 say "suite done"

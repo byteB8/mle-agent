@@ -1,7 +1,12 @@
-"""Per-task comparison of experiment arms (run tags), with each arm's mean ± sd over seeds.
+"""Per-task comparison of experiment arms (run tags), with each arm's mean ± sd over seeds, plus a
+normalised score so tasks with different metrics can be averaged:
+
+    normalised = (score - sample_submission_score) / (perfect_score - sample_submission_score)
+
+0 = no better than submitting the competition's sample file, 1 = perfect; negative = worse than the sample file.
 
     python compare.py react treepf              # every task that has runs for these tags
-    python compare.py react treepf --runs runs
+    python compare.py react treepf --runs runs --data data
 """
 from __future__ import annotations
 
@@ -23,6 +28,23 @@ def load(runs: Path, tags: list[str]) -> dict[tuple[str, str], list[dict]]:
     return out
 
 
+PERFECT = {"auc": 1.0, "accuracy": 1.0, "logloss": 0.0, "rmse": 0.0, "rmsle_mean": 0.0, "mae": 0.0}
+
+
+def chance_score(data_dir: Path, task: str) -> float | None:
+    """Score of the competition's own sample submission on the held-out test answers."""
+    from core.tasks import Task
+    root = data_dir / task
+    if not (root / "task.json").exists():
+        return None
+    t = Task.load(root)
+    return t.grade(t.public_dir / "sample_submission.csv")
+
+
+def normalise(score: float, chance: float, metric: str) -> float:
+    return (score - chance) / (PERFECT[metric] - chance)
+
+
 def cell(rs: list[dict]) -> tuple[str, float | None]:
     sc = [r["score"] for r in rs if r["score"] is not None]
     if not sc:
@@ -34,6 +56,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("tags", nargs="+")
     ap.add_argument("--runs", default="runs")
+    ap.add_argument("--data", default="data", help="task dirs, for the sample-submission (chance) score")
     a = ap.parse_args()
     data = load(Path(a.runs), a.tags)
     tasks = sorted({t for t, _ in data})
@@ -46,6 +69,24 @@ def main() -> None:
         scored = [(m, tag) for m, tag in zip(means, a.tags) if m is not None]
         best = (max if hib else min)(scored)[1] if scored else "-"
         print(f"| {t} | {any_run['metric']} {'↑' if hib else '↓'} | {' | '.join(cells)} | {best} |")
+    # normalised: mean over tasks of the per-task mean, and of the per-task worst seed
+    norm = {tag: ([], []) for tag in a.tags}
+    for t in tasks:
+        any_run = next(rs[0] for (tt, _), rs in data.items() if tt == t)
+        chance = chance_score(Path(a.data), t)
+        if chance is None or any_run["metric"] not in PERFECT:
+            continue
+        for tag in a.tags:
+            n = [normalise(r["score"], chance, any_run["metric"]) if r["score"] is not None else 0.0
+                 for r in data.get((t, tag), [])]   # a run with no valid submission counts as the sample file
+            if n:
+                norm[tag][0].append(st.mean(n))
+                norm[tag][1].append(min(n))
+    if all(norm[tag][0] for tag in a.tags):
+        k = len(norm[a.tags[0]][0])
+        print(f"| **normalised, mean over {k} tasks** | 0 = sample file, 1 = perfect | "
+              + " | ".join(f"{st.mean(norm[tag][0]):.3f} (worst seed {st.mean(norm[tag][1]):.3f})" for tag in a.tags)
+              + " | |")
     print()
     for t in tasks:
         for tag in a.tags:
