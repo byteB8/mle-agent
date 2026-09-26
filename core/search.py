@@ -16,6 +16,7 @@ from __future__ import annotations
 import random
 import re
 import shutil
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -107,6 +108,8 @@ class Node:
     exec_s: float = 0.0
     preflight_s: float = 0.0
     family: str = ""                # model family of the draft this node descends from (diverse drafts)
+    wall_s: float = 0.0             # wall-clock of the whole node: LLM call + pre-flight + run
+    purpose: str = ""               # "rescue" for nodes spent getting a family to work
     children: list[int] = field(default_factory=list)
 
     def summary(self) -> str:
@@ -154,6 +157,9 @@ class SearchConfig:
     family_rescue: bool = False     # with diverse drafts: make every family produce a valid node before exploiting,
     family_attempts: int = 3        # ... spending at most this many debug/redraft nodes per family
     runner_up_prob: float = 0.3     # ... and sometimes improve the best node of the runner-up family instead
+    cost_aware: bool = False        # budget exploration by measured node cost (below) instead of fixed rules
+    rescue_frac: float = 0.2        # ... family rescue may use at most this share of the time budget (wall-clock)
+    nodes_per_family: int = 8       # ... keep ~(estimated nodes left / this) families in play, ranked by best score
 
 
 class TreeSearchAgent:
@@ -170,6 +176,7 @@ class TreeSearchAgent:
         self.nodes: list[Node] = []
         self.data_preview = ""
         self.valid_labels = None    # set in harness-valid mode; never written under /work
+        self._purpose = ""
         self.lessons: dict[str, Lesson] = {}
         self.preflight_ids = None   # (valid ids, test ids) of the pre-flight sample, when pre-flight is on
         self.full_ratio = 1.0       # all training rows / search training rows
@@ -213,20 +220,51 @@ class TreeSearchAgent:
             return ("debug", leaves[-1], d.family) if leaves else ("draft", None, d.family)
         return None
 
+    def _rescue_spent(self) -> float:
+        return sum(n.wall_s for n in self.nodes if n.purpose == "rescue")
+
+    def _families_in_play(self) -> list[str] | None:
+        """Cost-aware narrowing: families with a valid node, best first, keeping about
+        (estimated nodes left / nodes_per_family) of them. Cheap nodes -> several families stay in play;
+        expensive nodes -> only the leader."""
+        ranked = []
+        for f in {n.family for n in self.nodes if n.family}:
+            b = self._best_of([n for n in self.nodes if n.family == f])
+            if b is not None:
+                ranked.append(b)
+        if not ranked:
+            return None
+        ranked.sort(key=lambda n: n.score, reverse=self.task.higher_is_better)
+        recent = [n.wall_s for n in self.nodes[-10:] if n.wall_s > 0]
+        per_node = sum(recent) / len(recent) if recent else 60.0
+        nodes_left = max(0.0, self._remaining() - self._final_reserve()) / per_node
+        k = int(min(len(ranked), max(1, nodes_left // self.cfg.nodes_per_family)))
+        return [n.family for n in ranked[:k]]
+
     def select(self) -> tuple[str, Node | None, str]:
-        """Returns (operation, parent node, model family for a draft)."""
+        """Returns (operation, parent node, model family for a draft). Sets self._purpose for the node."""
+        self._purpose = ""
         drafts = [n for n in self.nodes if n.parent is None]
         if len(drafts) < self.cfg.num_drafts:
             return "draft", None, self._next_family()
-        if self.cfg.diverse_drafts and self.cfg.family_rescue:
+        rescue_ok = not self.cfg.cost_aware or self._rescue_spent() < self.cfg.rescue_frac * self.budget.time_limit_s
+        if self.cfg.diverse_drafts and self.cfg.family_rescue and rescue_ok:
             rescue = self._rescue()
             if rescue:
+                self._purpose = "rescue"
                 return rescue
+        in_play = self._families_in_play() if self.cfg.cost_aware else None
         if self.rng.random() < self.cfg.debug_prob:
             debuggable = [n for n in self.nodes if n.buggy and not n.children
-                          and n.debug_depth < self.cfg.max_debug_depth and n.code]
+                          and n.debug_depth < self.cfg.max_debug_depth and n.code
+                          and (in_play is None or not n.family or n.family in in_play)]
             if debuggable:
                 return "debug", self.rng.choice(debuggable), ""
+        if in_play:
+            # geometric preference over the families in play: leader 1/2, next 1/4, ...
+            weights = [0.5 ** i for i in range(len(in_play))]
+            fam = self.rng.choices(in_play, weights=weights)[0]
+            return "improve", self._best_of([n for n in self.nodes if n.family == fam]), ""
         best = self.best()
         if best and self.cfg.family_rescue and self.rng.random() < self.cfg.runner_up_prob:
             others = [self._best_of([n for n in self.nodes if n.family == f])
@@ -363,7 +401,9 @@ class TreeSearchAgent:
             node.output += f"\n[harness] {node.error}"
 
     def _step(self) -> bool:
+        t_start = time.monotonic()
         op, parent, family = self.select()
+        purpose = self._purpose
         prompt = self._prompt(op, parent, family)
         family = family or (parent.family if parent else "")   # descendants keep their draft's family
         try:
@@ -389,6 +429,7 @@ class TreeSearchAgent:
         else:
             node.error = "no ```python code block in the reply"
             node.output = f"[harness] {node.error}"
+        node.wall_s, node.purpose = time.monotonic() - t_start, purpose
         self.nodes.append(node)
         self._learn(node)
         best = self.best()
@@ -397,6 +438,7 @@ class TreeSearchAgent:
                         code=node.code, output=truncate(node.output, 4000), score=node.score,
                         self_score=node.self_score, buggy=node.buggy,
                         error=node.error, exec_s=round(node.exec_s, 1), preflight_s=round(node.preflight_s, 1),
+                        wall_s=round(node.wall_s, 1), purpose=node.purpose,
                         prompt=prompt, response=text,
                         prompt_tokens=c.prompt_tokens, completion_tokens=c.completion_tokens,
                         llm_latency=round(c.latency, 2), best_id=best.id if best else None,
@@ -552,6 +594,7 @@ class TreeSearchAgent:
                 "draft_families": [n.family for n in self.nodes if n.op == "draft" and n.family],
                 "valid_families": sorted({n.family for n in self.nodes if n.family and not n.buggy}),
                 "best_family": best.family if best else None,
+                "rescue_s": round(self._rescue_spent(), 1),
                 "preflight_rejects": sum(n.error.startswith("pre-flight") for n in self.nodes),
                 "steps": self.state.step, "elapsed_s": round(self.state.elapsed(), 1),
                 "total_prompt_tokens": self.state.total_prompt_tokens,

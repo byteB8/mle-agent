@@ -429,6 +429,29 @@ class TestRefitAndDiversity(unittest.TestCase):
         agent, _, _ = self.run_rescue(turns, family_attempts=2)
         self.assertEqual([n.op for n in agent.nodes], ["draft", "draft", "draft", "debug", "debug", "improve"])
 
+    def test_cost_aware_narrows_families_when_nodes_are_expensive(self):
+        from core.search import Node
+        d = Path(tempfile.mkdtemp())
+        agent = TreeSearchAgent(None, make_task(d / "t"), None, Tracer(None), Budget(time_limit_s=1800),
+                                SearchConfig(cost_aware=True, nodes_per_family=8), seed=0)
+        for i, (fam, score) in enumerate([("A", 0.9), ("B", 0.8), ("C", 0.7)]):
+            agent.nodes.append(Node(id=i, parent=None, op="draft", family=fam, score=score, buggy=False))
+        agent._remaining = lambda: 300.0
+        for n in agent.nodes:
+            n.wall_s = 1.0      # cheap: ~300 nodes left -> every family stays in play, best first
+        self.assertEqual(agent._families_in_play(), ["A", "B", "C"])
+        for n in agent.nodes:
+            n.wall_s = 100.0    # expensive: ~3 nodes left -> only the leader
+        self.assertEqual(agent._families_in_play(), ["A"])
+
+    def test_cost_aware_caps_rescue_budget(self):
+        ok = GOOD.format(preds=[.1, .9, .2, .8], val=0.6)
+        turns = [reply("d0", "raise SystemExit(1)"), reply("d1", ok), reply("d2", ok), reply("next", ok)]
+        agent, _, _ = self.run_rescue(turns, cost_aware=True, rescue_frac=0.0)
+        self.assertEqual(agent.nodes[3].op, "improve")          # no budget left for rescuing family A
+        agent, _, _ = self.run_rescue(turns, cost_aware=True, rescue_frac=0.5)
+        self.assertEqual((agent.nodes[3].op, agent.nodes[3].purpose), ("debug", "rescue"))
+
     def test_unterminated_code_block_is_recovered(self):
         from core.search import extract_code
         self.assertEqual(extract_code("plan\n```python\nprint(1)\n```\nmore\n```python\nprint(2)\n```"), "print(2)")
