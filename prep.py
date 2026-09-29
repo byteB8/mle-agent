@@ -193,7 +193,87 @@ Metric: ROC AUC (higher is better).
 """)
 
 
-TASKS = {"dev-adult": dev_adult, "tabular-playground-series-may-2022": tps_may_2022,
+# ---------------------------------------------------------------- phase-2 training tasks (never used for evaluation)
+
+OPENML = {  # name -> (OpenML data_id, kind); kind: binary -> AUC, multiclass -> log loss, regression -> RMSE
+    "credit-g": (31, "binary"), "diabetes": (37, "binary"), "spambase": (44, "binary"),
+    "blood-transfusion": (1464, "binary"), "phoneme": (1489, "binary"), "kc1": (1067, "binary"),
+    "bank-marketing": (1461, "binary"), "electricity": (151, "binary"), "ozone-level": (1487, "binary"),
+    "qsar-biodeg": (1494, "binary"), "ilpd": (1480, "binary"), "churn": (40701, "binary"),
+    "magic-telescope": (1120, "binary"), "kr-vs-kp": (3, "binary"),
+    "vehicle": (54, "multiclass"), "segment": (40984, "multiclass"), "satimage": (182, "multiclass"),
+    "car": (40975, "multiclass"), "cmc": (23, "multiclass"), "optdigits": (28, "multiclass"),
+    "wine-quality": (287, "regression"), "cpu-act": (197, "regression"), "house-sales": (42731, "regression"),
+    "diamonds": (42225, "regression"),
+}
+
+
+def _write_supervised(root: Path, name: str, df, target: str, kind: str, description: str) -> None:
+    import numpy as np
+    df = df.copy()
+    df.insert(0, "id", range(len(df)))
+    if kind == "regression":
+        df[target] = df[target].astype(float)
+        tr, te = train_test_split(df, test_size=0.25, random_state=0)
+        spec = {"metric": "rmse", "id_col": "id", "target_cols": [target], "higher_is_better": False}
+        answers, sample = te[["id", target]], te[["id"]].assign(**{target: float(tr[target].mean())})
+        metric = "RMSE (lower is better)"
+    else:
+        y = df[target].astype(str)
+        classes = sorted(y.unique())
+        df[target] = y
+        tr, te = train_test_split(df, test_size=0.25, random_state=0, stratify=y)
+        if kind == "binary":
+            pos = classes[1]
+            tr = tr.assign(**{target: (tr[target] == pos).astype(int)})
+            te = te.assign(**{target: (te[target] == pos).astype(int)})
+            spec = {"metric": "auc", "id_col": "id", "target_cols": [target], "higher_is_better": True}
+            answers, sample = te[["id", target]], te[["id"]].assign(**{target: 0.5})
+            metric = f"ROC AUC for P({target} = 1), where 1 means '{pos}' (higher is better)"
+        else:
+            spec = {"metric": "logloss", "id_col": "id", "target_cols": classes, "higher_is_better": False,
+                    "label_col": target}
+            onehot = np.eye(len(classes))[[classes.index(v) for v in te[target]]].astype(int)
+            answers = pd.concat([te[["id"]].reset_index(drop=True),
+                                 pd.DataFrame(onehot, columns=classes)], axis=1)
+            sample = te[["id"]].assign(**{c: 1 / len(classes) for c in classes})
+            metric = f"multi-class log loss over the {len(classes)} classes (lower is better)"
+    spec["source"] = f"openml-train:{name}"
+    test = te.drop(columns=[target])
+    sub_cols = "`id` plus one probability column per class" if kind == "multiclass" else f"`id,{target}`"
+    write_task(root / f"ml-{name}", tr, test, answers, sample, spec,
+               f"# {name}\n\n{description}\n\n- `train.csv`: `id`, features, `{target}`.\n- `test.csv`: `id`, "
+               f"features.\n- Submit {sub_cols} in the format of `sample_submission.csv`.\n\nMetric: {metric}.\n")
+
+
+def openml_suite(out: Path, raw: Path) -> None:
+    """Training tasks for phase 2 (OpenML datasets + one text task). Built on a machine with internet."""
+    from sklearn.datasets import fetch_20newsgroups, fetch_openml
+    done, failed = [], []
+    for name, (did, kind) in OPENML.items():
+        try:
+            b = fetch_openml(data_id=did, as_frame=True, parser="auto")
+            df = b.frame
+            target = b.target.name if hasattr(b.target, "name") else b.target_names[0]
+            if len(df) > 200_000:
+                df = df.sample(n=200_000, random_state=0)
+            _write_supervised(out, name, df, target, kind,
+                              f"Tabular {kind} task from OpenML dataset {did} ({name}), {len(df)} rows.")
+            done.append(name)
+        except Exception as e:  # network hiccup, changed dataset: skip it, report it
+            failed.append(f"{name}: {type(e).__name__}: {str(e)[:80]}")
+    cats = ["comp.graphics", "rec.sport.hockey", "sci.med", "talk.politics.guns"]
+    ng = fetch_20newsgroups(subset="all", categories=cats, remove=("headers", "footers", "quotes"))
+    df = pd.DataFrame({"text": ng.data, "topic": [ng.target_names[t] for t in ng.target]})
+    _write_supervised(out, "newsgroups4", df[df.text.str.strip() != ""], "topic", "multiclass",
+                      "Text classification: which newsgroup a post comes from (4 topics), from its text only.")
+    done.append("newsgroups4")
+    print(f"built {len(done)} tasks: {done}")
+    for f in failed:
+        print("  skipped", f)
+
+
+TASKS = {"dev-adult": dev_adult, "openml-suite": openml_suite, "tabular-playground-series-may-2022": tps_may_2022,
          "tabular-playground-series-dec-2021": tps_dec_2021, "nomad2018-predict-transparent-conductors": nomad2018,
          "leaf-classification": leaf, "spooky-author-identification": spooky, "random-acts-of-pizza": pizza}
 
@@ -203,7 +283,7 @@ if __name__ == "__main__":
     ap.add_argument("--out", default="data")
     ap.add_argument("--raw", default="../kaggle_raw", help="dir with <competition>/x/ extracted files")
     a = ap.parse_args()
-    names = [n for n in TASKS if n != "dev-adult"] if a.task == "all-kaggle" else [a.task]
+    names = [n for n in TASKS if n not in ("dev-adult", "openml-suite")] if a.task == "all-kaggle" else [a.task]
     for n in names:
         TASKS[n](Path(a.out), Path(a.raw))
         print("ok", Path(a.out) / n)

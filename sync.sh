@@ -9,7 +9,7 @@ SSH="ssh -p ${PORT:-22}"
 case "${1:-push}" in
   push) rsync -az -e "$SSH" --delete \
           --exclude .git --exclude '*.md' --exclude .remote --exclude sync.sh --exclude __pycache__ \
-          --exclude runs/ --exclude data/ --exclude hf/ --exclude cache/ --exclude venv/ --exclude tmp/ --exclude compat/ --exclude logs/ --exclude results/ \
+          --exclude runs/ --exclude data/ --exclude data_train/ --exclude hf/ --exclude cache/ --exclude venv/ --exclude tmp/ --exclude compat/ --exclude logs/ --exclude results/ \
           ./ "${REMOTE}:${DIR}/" ;;
   data) rsync -az -e "$SSH" --info=stats1 data/ "${REMOTE}:${DIR}/data/" ;;   # task dirs (built locally by prep.py)
   pull) rsync -az -e "$SSH" --exclude 'work/' "${REMOTE}:${DIR}/runs/" results/runs/ ;;

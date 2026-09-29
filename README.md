@@ -33,6 +33,8 @@ quality vs. cost against the large model.
 | `suite.sh` | arms over a suite of tasks, every (task, seed) in parallel |
 | `sweep.sh` | several experiment arms back to back on one server (ablations) |
 | `stats.py` | per-run behaviour stats from traces (errors, CV use, early submits, tokens) |
+| `export.py` | phase 2: tree traces -> chat SFT dataset (useful steps only: valid drafts, fixes, real improvements) |
+| `train.py` | phase 2: LoRA fine-tuning in a plain PyTorch loop (prompt-masked loss, token-budget batches, run-level eval split), merged for vLLM |
 | `env/Dockerfile` | sandbox runtime image |
 
 ## Running
@@ -43,6 +45,7 @@ quality vs. cost against the large model.
 docker build -t exp-rt:cpu env/       # sandbox image
 python prep.py dev-adult --out data   # smoke-test task
 python prep.py all-kaggle --raw ../kaggle_raw   # 6 MLE-bench Lite competitions, re-split (needs Kaggle downloads)
+python prep.py openml-suite --out data_train    # phase-2 training tasks (OpenML + 20 Newsgroups), never used for eval
 python run.py --task data/dev-adult --time-limit-min 30
 python test.py
 ```

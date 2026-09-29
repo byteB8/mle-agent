@@ -481,6 +481,57 @@ class TestPreview(unittest.TestCase):
         self.assertNotIn("np.", out)
 
 
+class TestExport(unittest.TestCase):
+    def test_keeps_only_useful_steps(self):
+        from export import run_examples
+        d = Path(tempfile.mkdtemp())
+        task = make_task(d / "t")
+        ok = lambda v: GOOD.format(preds=[.1, .9, .2, .8], val=v)
+        turns = [reply("draft ok", ok(0.5)), reply("draft broken", "raise SystemExit(1)"),
+                 reply("fix", ok(0.6)), reply("improve up", ok(0.9)), reply("improve down", ok(0.4))]
+        run = d / "run"
+        run.mkdir()
+        tracer = Tracer(run / "trace.jsonl")
+        with LocalSandbox("x", "img", run / "work", task.public_dir) as sb:
+            agent = TreeSearchAgent(ScriptedLLM(turns), task, sb, tracer, Budget(max_steps=5, time_limit_s=300),
+                                    SearchConfig(num_drafts=2, debug_prob=1.0, harness_valid=False), seed=0)
+            res = agent.run()
+        tracer.close()
+        (run / "result.json").write_text(json.dumps(res))
+        ops = [n.op for n in agent.nodes]
+        self.assertEqual(ops, ["draft", "draft", "debug", "improve", "improve"])
+        kept = run_examples(run, "useful")
+        self.assertEqual([e["meta"]["op"] for e in kept], ["draft", "debug", "improve"])  # not broken, not worse
+        self.assertEqual(kept[0]["messages"][0]["role"], "system")
+        self.assertIn("draft ok", kept[0]["messages"][2]["content"])
+        self.assertEqual(len(run_examples(run, "valid")), 4)
+
+
+class TestTrainHelpers(unittest.TestCase):
+    def test_split_by_run_keeps_runs_whole(self):
+        from train import split_by_run
+        ex = [{"meta": {"run": f"r{i % 10}"}, "i": i} for i in range(100)]
+        tr, ev = split_by_run(ex, 0.2, seed=0)
+        self.assertEqual(len(tr) + len(ev), 100)
+        self.assertFalse({e["meta"]["run"] for e in tr} & {e["meta"]["run"] for e in ev})
+        self.assertEqual(len({e["meta"]["run"] for e in ev}), 2)
+
+    def test_token_batches_respect_budget_and_cover_all(self):
+        from train import token_batches
+        lengths = [100, 5000, 300, 2000, 16000, 50, 800, 800]
+        batches = token_batches(lengths, 16384, seed=1)
+        self.assertEqual(sorted(i for b in batches for i in b), list(range(len(lengths))))
+        for b in batches:
+            self.assertTrue(len(b) == 1 or max(lengths[i] for i in b) * len(b) <= 16384)
+
+    def test_mask_and_schedule(self):
+        from train import lr_at, mask_prompt
+        self.assertEqual(mask_prompt([1, 2, 3, 4, 5], 3), [-100, -100, -100, 4, 5])
+        self.assertAlmostEqual(lr_at(0, 100, 1e-4), 1e-4 / 3)                 # warm-up
+        self.assertAlmostEqual(lr_at(3, 100, 1e-4), 1e-4)                     # peak after warm-up
+        self.assertLess(lr_at(99, 100, 1e-4), 1e-6)                           # cosine to ~0
+
+
 class TestHarnessValidation(unittest.TestCase):
     def test_leaky_self_report_loses_to_honest_script(self):
         d = Path(tempfile.mkdtemp())
