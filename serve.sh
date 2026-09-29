@@ -24,6 +24,11 @@ if [ "$MODE" = stop ]; then
   if running; then kill "$(cat "$PIDFILE")"; sleep 5; fi
   rm -f "$PIDFILE"; echo "stopped (port $PORT)"; exit 0
 fi
+# Serialise start/ensure per port: concurrent callers (e.g. two suites sharing one server) would otherwise both
+# see "not answering", and the second would kill the first's half-started server. The lock is held until this
+# script exits, so a waiting `ensure` re-checks only after the first one's server is ready (or has failed).
+exec 9>"$BASE/logs/srv-${PORT}.lock"
+flock 9
 if [ "$MODE" = ensure ] && curl -sf "$URL" >/dev/null; then
   echo "server already up on port $PORT"; exit 0
 fi
