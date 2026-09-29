@@ -55,7 +55,7 @@ export CUDA_VISIBLE_DEVICES=$GPU HF_HOME=$BASE/hf HF_HUB_OFFLINE=1 TMPDIR=$BASE/
 # settings go through the environment and main.py pins every process title, so ps/nvitop show a generic
 # `python main.py` instead of the vLLM command line and its APIServer/EngineCore titles
 export SRV_MODEL=$MODEL SRV_PORT=$PORT PROC_TITLE="python main.py"
-setsid nohup python main.py > "$LOGFILE" 2>&1 < /dev/null &
+setsid nohup python main.py > "$LOGFILE" 2>&1 < /dev/null 9>&- &   # 9>&-: the server must not inherit the lock
 echo $! > "$PIDFILE"
 echo "started LLM server (pid $(cat "$PIDFILE")) on GPU ${GPU}, port ${PORT}; log: ${LOGFILE#$BASE/}"
 
