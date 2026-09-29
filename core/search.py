@@ -160,6 +160,7 @@ class SearchConfig:
     cost_aware: bool = False        # budget exploration by measured node cost (below) instead of fixed rules
     rescue_frac: float = 0.2        # ... family rescue may use at most this share of the time budget (wall-clock)
     nodes_per_family: int = 8       # ... keep ~(estimated nodes left / this) families in play, ranked by best score
+    structured_preview: bool = False  # harness-computed data summary instead of a raw `head` of each file
 
 
 class TreeSearchAgent:
@@ -466,6 +467,19 @@ class TreeSearchAgent:
             return "token_limit"
         return None
 
+    def _structured_preview(self, harness: bool) -> str:
+        from collections import OrderedDict
+        from .preview import data_preview
+        t = self.task
+        if harness:
+            files = OrderedDict((f"/work/input/{self.input_names[k]}", self.sandbox.host_path(f"input/{self.input_names[k]}"))
+                                for k in ("train", "valid", "test"))
+        else:
+            files = OrderedDict([(f"/data/{t.train_file}", t.public_dir / t.train_file),
+                                 (f"/data/{t.test_file}", t.public_dir / t.test_file)])
+        targets = [t.label_col] if t.label_col else t.target_cols
+        return data_preview(files, targets, t.public_dir / "sample_submission.csv")
+
     def _setup_harness_valid(self) -> None:
         seed = self.seed or 0
         train, valid_x, valid_y = self.task.split_train(seed=seed, valid_frac=self.cfg.valid_frac)
@@ -528,10 +542,13 @@ class TreeSearchAgent:
                             "runtime scalable.")
         if self.use_env_facts:
             self.system += env_facts(sb)
-        where = "/work/input/* /data/sample_submission.csv" if harness else "/data/*"
-        preview = sb.exec(f"for f in {where}; do echo \"== $f ($(wc -l < \"$f\") lines)\"; "
-                          "head -c 1500 \"$f\" | head -n 4; echo; done", timeout=60)
-        self.data_preview = truncate(preview.output, 6000)
+        if self.cfg.structured_preview:
+            self.data_preview = truncate(self._structured_preview(harness), 8000)
+        else:
+            where = "/work/input/* /data/sample_submission.csv" if harness else "/data/*"
+            preview = sb.exec(f"for f in {where}; do echo \"== $f ($(wc -l < \"$f\") lines)\"; "
+                              "head -c 1500 \"$f\" | head -n 4; echo; done", timeout=60)
+            self.data_preview = truncate(preview.output, 6000)
         self.tracer.log("episode_start", task=self.task.name, model=self.llm.model, agent="tree",
                         budget=vars(self.budget), config=vars(self.cfg), system=self.system, harness_valid=harness,
                         data_preview=self.data_preview)

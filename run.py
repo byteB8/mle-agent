@@ -52,6 +52,8 @@ def main() -> None:
                     help="tree: with diverse drafts, get every family to a valid node before exploiting")
     ap.add_argument("--cost-aware", action="store_true",
                     help="tree: cap rescue at a share of the budget and narrow families by measured node cost")
+    ap.add_argument("--structured-preview", action="store_true",
+                    help="tree: harness-computed data summary (format, fields, types, train-only fields)")
     ap.add_argument("--self-valid", action="store_true",
                     help="tree: trust the script's printed VALIDATION_SCORE instead of a harness-held split")
     args = ap.parse_args()
@@ -78,7 +80,7 @@ def main() -> None:
                                    lessons=args.lessons, preflight_rows=args.preflight_rows,
                                    search_max_rows=args.search_max_rows, refit_max_ratio=args.refit_max_ratio,
                                    diverse_drafts=args.diverse_drafts, family_rescue=args.family_rescue,
-                                   cost_aware=args.cost_aware)
+                                   cost_aware=args.cost_aware, structured_preview=args.structured_preview)
                 agent = TreeSearchAgent(llm, task, sandbox, tracer, budget, cfg, temperature=args.temperature,
                                         seed=args.seed, use_env_facts=args.env_facts)
             else:

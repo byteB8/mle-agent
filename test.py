@@ -459,6 +459,28 @@ class TestRefitAndDiversity(unittest.TestCase):
         self.assertEqual(extract_code("no code here"), "")
 
 
+class TestPreview(unittest.TestCase):
+    def test_json_format_targets_train_only_and_odd_columns(self):
+        from collections import OrderedDict
+        from core.preview import data_preview
+        d = Path(tempfile.mkdtemp())
+        tr = pd.DataFrame({"rid": ["a", "b", "c", "d"], "f_1": [1.5, 2, 3, 4], "f_2": [1.5, 2, 3, 4],
+                           "f_3": ["x1", "x2", "x3", "x4"], "f_4": [1.5, 2, 3, 4], "votes_at_retrieval": [1, 2, 3, 4],
+                           "y": [True, False, True, False]})
+        tr.to_json(d / "train.json", orient="records")
+        tr.drop(columns=["y", "votes_at_retrieval"]).to_json(d / "test.json", orient="records")
+        pd.DataFrame({"rid": ["a"], "y": [0.5]}).to_csv(d / "sample.csv", index=False)
+        out = data_preview(OrderedDict([("/work/input/train.json", d / "train.json"),
+                                        ("/work/input/test.json", d / "test.json")]), ["y"], d / "sample.csv")
+        self.assertIn("JSON array of 4 records", out)
+        self.assertIn("NOT JSON-lines", out)
+        self.assertIn("f_1..f_4: 4 columns (3 float; the others listed below)", out)
+        self.assertIn("- f_3: str, 4 unique, e.g. 'x1'", out)            # the odd one out is spelled out
+        self.assertIn("- y: bool, e.g. True  [TARGET: only in train]", out)
+        self.assertIn("votes_at_retrieval: int, e.g. 1  [only in train: not a usable feature]", out)
+        self.assertNotIn("np.", out)
+
+
 class TestHarnessValidation(unittest.TestCase):
     def test_leaky_self_report_loses_to_honest_script(self):
         d = Path(tempfile.mkdtemp())
