@@ -273,7 +273,31 @@ def openml_suite(out: Path, raw: Path) -> None:
         print("  skipped", f)
 
 
-TASKS = {"dev-adult": dev_adult, "openml-suite": openml_suite, "tabular-playground-series-may-2022": tps_may_2022,
+def sklearn_suite(out: Path, raw: Path) -> None:
+    """Extra phase-2 training tasks from scikit-learn's bundled/cached datasets, mainly for multiclass coverage.
+    Forest cover-type is deliberately excluded: TPS Dec-2021 (an eval task) is generated from it."""
+    from sklearn import datasets as D
+    built = []
+    for name, loader, kind in (("digits", D.load_digits, "multiclass"), ("wine", D.load_wine, "multiclass"),
+                               ("california-housing", D.fetch_california_housing, "regression")):
+        b = loader(as_frame=True)
+        df = b.frame.copy()
+        target = b.target.name
+        if kind == "multiclass":
+            df[target] = [f"class_{v}" for v in df[target]]
+        _write_supervised(out, name, df, target, kind, f"Tabular {kind} task ({name}), {len(df)} rows.")
+        built.append(name)
+    # many classes, few samples per class (the leaf-classification regime), from a known generator
+    X, y = D.make_classification(n_samples=360 * 2, n_features=48, n_informative=24, n_redundant=8, n_classes=30,
+                                 n_clusters_per_class=1, class_sep=1.5, random_state=0)
+    df = pd.DataFrame(X, columns=[f"feat{i + 1}" for i in range(X.shape[1])]).assign(label=[f"c{v:02d}" for v in y])
+    _write_supervised(out, "many-classes", df, "label", "multiclass",
+                      "Synthetic 30-class problem with only ~18 training rows per class: 48 numeric features.")
+    built.append("many-classes")
+    print(f"built {len(built)} tasks: {built}")
+
+
+TASKS = {"dev-adult": dev_adult, "openml-suite": openml_suite, "sklearn-suite": sklearn_suite, "tabular-playground-series-may-2022": tps_may_2022,
          "tabular-playground-series-dec-2021": tps_dec_2021, "nomad2018-predict-transparent-conductors": nomad2018,
          "leaf-classification": leaf, "spooky-author-identification": spooky, "random-acts-of-pizza": pizza}
 
@@ -283,7 +307,8 @@ if __name__ == "__main__":
     ap.add_argument("--out", default="data")
     ap.add_argument("--raw", default="../kaggle_raw", help="dir with <competition>/x/ extracted files")
     a = ap.parse_args()
-    names = [n for n in TASKS if n not in ("dev-adult", "openml-suite")] if a.task == "all-kaggle" else [a.task]
+    names = ([n for n in TASKS if n not in ("dev-adult", "openml-suite", "sklearn-suite")]
+             if a.task == "all-kaggle" else [a.task])
     for n in names:
         TASKS[n](Path(a.out), Path(a.raw))
         print("ok", Path(a.out) / n)
